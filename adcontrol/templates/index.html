@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>adcontrol — AD Object Control Analyzer</title>
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<style>
+:root{color-scheme:light dark;--hi:#e5484d;--med:#e0a800;--lo:#3a9e6a;--bg:#0f1012;--panel:#1a1b1e;--line:#2c2e33;--fg:#e7e7ea;--dim:#8b8d93;--accent:#5b8def}
+*{box-sizing:border-box}
+body{margin:0;font:14px/1.5 system-ui,sans-serif;background:var(--bg);color:var(--fg)}
+header{padding:.8rem 1.2rem;background:var(--panel);border-bottom:1px solid var(--line);display:flex;align-items:center;gap:1rem;flex-wrap:wrap}
+header h1{font-size:1.1rem;margin:0}header .tag{color:var(--dim);font-size:.8rem}
+header .status{margin-left:auto;font-size:.8rem;color:var(--dim)}
+.wrap{display:grid;grid-template-columns:340px 1fr;gap:1rem;padding:1rem;align-items:start}
+@media(max-width:900px){.wrap{grid-template-columns:1fr}}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:1rem}
+.panel h2{font-size:.95rem;margin:0 0 .7rem}
+label{display:block;font-size:.75rem;color:var(--dim);margin:.5rem 0 .15rem;text-transform:uppercase;letter-spacing:.03em}
+input,select{width:100%;padding:.45rem .55rem;background:var(--bg);border:1px solid var(--line);border-radius:6px;color:var(--fg);font:inherit}
+.row{display:flex;gap:.5rem}.row>*{flex:1}
+.chk{display:flex;align-items:center;gap:.4rem;margin:.4rem 0;font-size:.85rem;color:var(--fg)}
+.chk input{width:auto}
+button{padding:.5rem .9rem;background:var(--accent);color:#fff;border:0;border-radius:6px;font:inherit;cursor:pointer;font-weight:600}
+button.ghost{background:transparent;border:1px solid var(--line);color:var(--fg);font-weight:400}
+button:disabled{opacity:.5;cursor:not-allowed}
+.log{margin-top:.8rem;max-height:220px;overflow:auto;font:12px/1.45 ui-monospace,monospace;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:.5rem}
+.log div{white-space:pre-wrap}.log .error{color:var(--hi)}.log .warn{color:var(--med)}.log .info{color:var(--dim)}
+.search{margin-bottom:.6rem}
+.plist{max-height:340px;overflow:auto;border:1px solid var(--line);border-radius:6px}
+.pitem{padding:.4rem .6rem;border-bottom:1px solid var(--line);cursor:pointer;display:flex;gap:.5rem;align-items:center}
+.pitem:hover{background:#ffffff0a}.pitem.sel{background:var(--accent)22;border-left:3px solid var(--accent)}
+.pill{font-size:.62rem;text-transform:uppercase;padding:.05em .4em;border-radius:99px;background:#ffffff18;color:var(--dim)}
+.pill.user{background:#3a9e6a33;color:#7fdcaa}.pill.group{background:#5b8def33;color:#9bbcf5}.pill.computer{background:#e0a80033;color:#f0cf6a}
+.subjhead{display:flex;align-items:center;gap:1rem;flex-wrap:wrap;margin-bottom:1rem}
+.subjhead h2{margin:0;font-size:1.2rem}
+.cards{display:flex;gap:.7rem;flex-wrap:wrap;margin-left:auto}
+.card{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:.4rem .8rem;text-align:center;min-width:70px}
+.card b{display:block;font-size:1.3rem}.card span{font-size:.68rem;color:var(--dim)}
+.dir{margin-bottom:1.3rem}
+.dir h3{font-size:.95rem;margin:0 0 .5rem;padding-bottom:.35rem;border-bottom:2px solid var(--line);display:flex;align-items:center;gap:.5rem}
+.dir.out h3{border-color:var(--accent)}.dir.in h3{border-color:#b06de0}.dir.gpo h3{border-color:#e0a800}
+table{width:100%;border-collapse:collapse;font-size:.83rem}
+th,td{text-align:left;padding:.4rem .55rem;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--dim);font-weight:600;font-size:.72rem;text-transform:uppercase}
+.sev{color:#fff;padding:.05em .5em;border-radius:99px;font-size:.68rem;text-transform:uppercase}
+.sev.high{background:var(--hi)}.sev.medium{background:var(--med)}.sev.low{background:var(--lo)}
+.broad{background:var(--hi);color:#fff;font-size:.6rem;padding:.03em .35em;border-radius:3px;margin-left:.3em}
+.rt{font-weight:600}.scope{color:var(--dim);font-size:.9em}
+.none{color:var(--dim);font-style:italic;padding:.5rem 0}
+.hidenote{color:var(--dim);font-size:.8rem;font-style:italic;padding:.3rem 0 .5rem}
+.noiserow{opacity:.62}
+tbody tr{cursor:pointer}
+tbody tr:hover{background:#ffffff0d}
+.modalWrap{display:none;position:fixed;inset:0;background:#000a;z-index:50;padding:2rem;overflow:auto}
+.modalWrap.open{display:flex;align-items:flex-start;justify-content:center}
+.modalBox{background:var(--panel);border:1px solid var(--line);border-radius:12px;max-width:720px;width:100%;padding:1.4rem 1.6rem;position:relative;box-shadow:0 8px 40px #000a}
+.modalX{position:absolute;top:.6rem;right:.8rem;background:none;border:0;color:var(--dim);font-size:1.6rem;line-height:1;cursor:pointer;padding:0}
+.modalBox h3{margin:0 0 .2rem;font-size:1.2rem}
+.modalBox .sub{color:var(--dim);font-size:.85rem;margin-bottom:1rem}
+.chainSvg{width:100%;background:var(--bg);border:1px solid var(--line);border-radius:8px;margin:.4rem 0 1rem}
+.advBlock{margin:.9rem 0}
+.advBlock h4{margin:0 0 .3rem;font-size:.82rem;text-transform:uppercase;letter-spacing:.04em;display:flex;align-items:center;gap:.4rem}
+.advBlock.off h4{color:#e5484d}.advBlock.def h4{color:#3a9e6a}.advBlock.sum h4{color:var(--dim)}.advBlock.ops h4{color:#e0a800}
+.cmds{margin:.5rem 0 0;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:.6rem .7rem;font:12px/1.5 ui-monospace,monospace;color:#cdd3da;white-space:pre-wrap;overflow-x:auto}
+.bhlink{font-size:.78rem;color:var(--accent);text-decoration:none;margin-left:.4rem;white-space:nowrap}
+.bhlink:hover{text-decoration:underline}
+.advBlock p{margin:0;font-size:.9rem;line-height:1.5}
+.factgrid{display:grid;grid-template-columns:auto 1fr;gap:.2rem .8rem;font-size:.82rem;margin-top:.4rem}
+.factgrid .k{color:var(--dim)}.factgrid .v{font-family:ui-monospace,monospace;word-break:break-all}
+.exports{display:flex;gap:.5rem;margin-left:auto}
+.empty{color:var(--dim);text-align:center;padding:3rem 1rem}
+.mono{font-family:ui-monospace,monospace;font-size:.85em;color:var(--dim)}
+</style>
+</head>
+<body>
+<header>
+  <h1>adcontrol</h1><span class="tag">AD object-control analyzer</span>
+  <span class="status" id="status">not collected</span>
+</header>
+<div class="wrap">
+  <!-- LEFT: pick + collect -->
+  <div>
+    <div class="panel">
+      <h2>Principals</h2>
+      <input class="search" id="search" placeholder="search user / group / computer…" oninput="debouncedSearch()">
+      <div class="plist" id="plist"><div class="none" style="padding:.6rem">Collect or load a session first.</div></div>
+    </div>
+    <div class="panel" id="collectPanel" style="margin-top:1rem">
+      <h2 style="cursor:pointer;user-select:none" onclick="toggleCollect()"><span id="collectCaret">▾</span> Collect</h2>
+      <div id="collectBody">
+      <label>Domain Controller (host / IP)</label>
+      <input id="dc" placeholder="dc01.corp.local">
+      <div class="row">
+        <div><label>Username</label><input id="username" placeholder="user"></div>
+        <div><label>Domain</label><input id="domain" placeholder="corp.local"></div>
+      </div>
+      <label>Password</label><input id="password" type="password" placeholder="(or use hash / kerberos)">
+      <label>NT hash (PtH)</label><input id="nthash" placeholder="LM:NT or :NT">
+      <div class="chk"><input type="checkbox" id="kerberos"><label style="margin:0;text-transform:none;letter-spacing:0;color:var(--fg)">Kerberos</label></div>
+      <div class="chk"><input type="checkbox" id="ldaps"><label style="margin:0;text-transform:none;letter-spacing:0;color:var(--fg)">Force LDAPS</label></div>
+      <div class="row"><div><label>AES key (opt)</label><input id="aes_key"></div>
+        <div><label>DC IP (opt)</label><input id="dc_ip"></div></div>
+      <label style="margin-top:.7rem">Collection tier</label>
+      <div class="chk"><input type="checkbox" id="gpo" checked>
+        <label style="margin:0;text-transform:none;letter-spacing:0;color:var(--fg)">GPO rights (DC SYSVOL only — no host fan-out)</label></div>
+      <label style="margin-top:.4rem">Per-host RDP / admin (touches hosts)</label>
+      <select id="host_mode" onchange="document.getElementById('hostsRow').style.display=this.value==='list'?'block':'none'">
+        <option value="none">none (DC-only, default)</option>
+        <option value="all">all collected computers (noisy)</option>
+        <option value="list">specific hosts…</option>
+      </select>
+      <div id="hostsRow" style="display:none"><label>Hosts (comma-separated or file path)</label><input id="hosts" placeholder="ws01.corp.local,srv02.corp.local"></div>
+      <div style="margin-top:.8rem;display:flex;gap:.5rem">
+        <button id="collectBtn" onclick="startCollect()">Collect</button>
+        <select id="sessSel" class="ghost" style="flex:1" onchange="loadSession()"><option value="">load session…</option></select>
+      </div>
+      <div style="margin-top:.6rem;border-top:1px solid var(--line);padding-top:.6rem">
+        <label style="margin-top:0">Offline — import BloodHound zip</label>
+        <div style="display:flex;gap:.5rem;align-items:center">
+          <input type="file" id="bhFile" accept=".zip,.json" style="flex:1;font-size:.8rem">
+          <button class="ghost" onclick="importBloodhound()">Import</button>
+        </div>
+      </div>
+      <div class="log" id="log"></div>
+      </div><!-- /collectBody -->
+    </div>
+  </div>
+  <!-- RIGHT: results -->
+  <div class="panel" id="results">
+    <div class="empty" id="empty">Select a principal to see what it can control (outbound) and who can control it (inbound).</div>
+    <div id="detail" style="display:none"></div>
+  </div>
+</div>
+<!-- edge detail modal -->
+<div id="modal" class="modalWrap" onclick="if(event.target===this)closeModal()">
+  <div class="modalBox">
+    <button class="modalX" onclick="closeModal()">×</button>
+    <div id="modalBody"></div>
+  </div>
+</div>
+<script>
+const socket = io();
+let selectedKey = null;
+let currentAnalysis = null;      // last /api/analyze result, for re-render on toggle
+let hideBuiltin = true;          // hide built-in-admin→infra "noise" edges by default
+socket.on('log', m => appendLog(m.msg, m.level));
+socket.on('done', d => {
+  document.getElementById('collectBtn').disabled = false;
+  if(d.ok){ appendLog(`[done] ${d.count} objects, ${d.principals} principals`,'info'); refreshStatus(); loadPrincipals(''); }
+  else appendLog('[done] collection failed','error');
+});
+function appendLog(msg,level){const l=document.getElementById('log');const d=document.createElement('div');d.className=level||'info';d.textContent=msg;l.appendChild(d);l.scrollTop=l.scrollHeight;}
+function val(id){return document.getElementById(id).value.trim();}
+function chk(id){return document.getElementById(id).checked;}
+async function startCollect(){
+  document.getElementById('log').innerHTML='';
+  document.getElementById('collectBtn').disabled=true;
+  const body={dc:val('dc'),username:val('username'),domain:val('domain'),password:val('password'),
+    nthash:val('nthash'),kerberos:chk('kerberos'),ldaps:chk('ldaps'),aes_key:val('aes_key'),dc_ip:val('dc_ip'),
+    gpo:chk('gpo'),host_mode:document.getElementById('host_mode').value,hosts:val('hosts')};
+  const r=await fetch('/api/collect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  if(!r.ok){const e=await r.json();appendLog('[error] '+(e.error||r.status),'error');document.getElementById('collectBtn').disabled=false;}
+}
+async function importBloodhound(){
+  const f=document.getElementById('bhFile').files[0];
+  if(!f){appendLog('[bh] choose a BloodHound zip first','warn');return;}
+  document.getElementById('log').innerHTML='';
+  appendLog('[bh] uploading '+f.name+' ('+Math.round(f.size/1024)+' KB)…','info');
+  const fd=new FormData();fd.append('file',f);
+  try{
+    const r=await fetch('/api/import-bloodhound',{method:'POST',body:fd});
+    const s=await r.json();
+    if(!r.ok){appendLog('[bh] error: '+(s.error||r.status),'error');return;}
+    appendLog(`[bh] imported ${s.count} objects / ${s.principals} principals (${s.domain})`,'info');
+    refreshStatus();loadPrincipals('');
+    document.getElementById('collectBody').style.display='none';
+    document.getElementById('collectCaret').textContent='▸';
+  }catch(e){appendLog('[bh] upload failed: '+e.message,'error');}
+}
+async function refreshStatus(){const r=await fetch('/api/status');const s=await r.json();
+  document.getElementById('status').textContent=s.collected?`${s.domain} · ${s.count} objects · ${s.principals} principals`:(s.collecting?'collecting…':'not collected');}
+async function loadSessions(){const r=await fetch('/api/sessions');const s=await r.json();
+  const sel=document.getElementById('sessSel');s.sessions.forEach(n=>{const o=document.createElement('option');o.value=n;o.textContent=n;sel.appendChild(o);});}
+async function loadSession(){const name=document.getElementById('sessSel').value;if(!name)return;
+  const r=await fetch('/api/load-session',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
+  const s=await r.json();if(s.ok){appendLog(`[session] loaded ${s.count} objects`,'info');refreshStatus();loadPrincipals('');}else appendLog('[error] '+s.error,'error');}
+let searchTimer;
+function debouncedSearch(){clearTimeout(searchTimer);searchTimer=setTimeout(()=>loadPrincipals(document.getElementById('search').value),200);}
+async function loadPrincipals(q){
+  const r=await fetch('/api/principals?q='+encodeURIComponent(q||''));
+  if(!r.ok)return;const s=await r.json();const list=document.getElementById('plist');list.innerHTML='';
+  if(!s.principals.length){list.innerHTML='<div class="none" style="padding:.6rem">No matches.</div>';return;}
+  s.principals.forEach(p=>{const d=document.createElement('div');d.className='pitem'+(p.key===selectedKey?' sel':'');
+    d.onclick=()=>selectPrincipal(p.key,d);
+    d.innerHTML=`<span class="pill ${p.class}">${p.class}</span><span>${esc(p.label)}</span>${p.admin_count?'<span class="broad">adminCount</span>':''}`;
+    list.appendChild(d);});
+}
+function esc(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+async function selectPrincipal(key,el){
+  selectedKey=key;document.querySelectorAll('.pitem').forEach(x=>x.classList.remove('sel'));if(el)el.classList.add('sel');
+  const r=await fetch('/api/analyze/'+encodeURIComponent(key));const s=await r.json();
+  if(!r.ok){alert(s.error);return;}currentAnalysis=s;renderDetail(s,key);
+}
+function edgeTable(edges,dir){
+  const total=edges.length;
+  const shown=hideBuiltin?edges.filter(e=>!e.builtin_noise):edges;
+  const hidden=total-shown.length;
+  const note=hidden>0
+    ? `<div class="hidenote">${hidden} built-in ${hidden===1?'entry':'entries'} hidden `
+      +`(built-in admin over system objects). Toggle “Show built-in” above to reveal.</div>`
+    : '';
+  if(!shown.length)return note||'<div class="none">None.</div>';
+  const whoCol=dir==='out'?'Target':'Principal';
+  // Stash the shown edges so a row click can look its edge up by index.
+  window._edges=window._edges||{}; window._edges[dir]=shown;
+  let rows=shown.map((e,i)=>{const who=dir==='out'?e.target_label:e.source_label;
+    return `<tr class="${e.builtin_noise?'noiserow':''}" onclick="openEdge('${dir}',${i})" title="Click for detail, attack path & advice"><td><span class="sev ${e.severity}">${e.severity}</span></td>
+      <td class="rt">${esc(e.right)}</td>
+      <td>${esc(who)}${e.broad?'<span class="broad">BROAD</span>':''}${e.builtin_noise?'<span class="pill" style="margin-left:.3em">built-in</span>':''}</td>
+      <td>${esc(e.target_class)}</td><td>${esc(e.via)}</td>
+      <td class="scope">${esc(e.applies_to||'whole object')}</td></tr>`;}).join('');
+  return note+`<table><thead><tr><th>Sev</th><th>Right</th><th>${whoCol}</th><th>Class</th><th>Via</th><th>Scope</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+function toggleBuiltin(cb){hideBuiltin=!cb.checked;if(currentAnalysis)renderDetail(currentAnalysis,selectedKey);}
+function policyTable(prs){
+  if(!prs.length)return '<div class="none">None found (or GPO/host planes not collected).</div>';
+  let rows=prs.map(p=>`<tr>
+    <td><span class="pill">${esc(p.plane)}</span></td>
+    <td><span class="sev ${p.severity}">${p.severity}</span></td>
+    <td class="rt">${esc(p.right)}</td>
+    <td>${esc((p.trustees||[]).join(', '))}</td>
+    <td class="scope">${esc(p.applies_to)}</td>
+    <td class="scope">${esc(p.source)}</td></tr>`).join('');
+  return `<table><thead><tr><th>Plane</th><th>Sev</th><th>Right</th><th>Granted to</th><th>Applies to</th><th>Source</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+function renderDetail(s,key){
+  document.getElementById('empty').style.display='none';
+  const d=document.getElementById('detail');d.style.display='block';
+  const su=s.subject;
+  d.innerHTML=`
+    <div class="subjhead">
+      <div><h2>${esc(su.label)} <span class="pill ${su.class}">${su.class}</span></h2>
+        <div class="mono">${esc(su.dn)}</div></div>
+      <div class="cards">
+        <div class="card"><b>${s.outbound.length}</b><span>outbound</span></div>
+        <div class="card"><b style="color:var(--hi)">${s.outbound_high}</b><span>out high</span></div>
+        <div class="card"><b>${s.inbound.length}</b><span>inbound</span></div>
+        <div class="card"><b style="color:var(--hi)">${s.inbound_high}</b><span>in high</span></div>
+        <div class="card"><b>${s.effective_group_count}</b><span>groups</span></div>
+      </div>
+    </div>
+    <div style="display:flex;gap:.5rem;margin-bottom:1rem;align-items:center;flex-wrap:wrap">
+      <a href="/api/report/${encodeURIComponent(key)}?fmt=html"><button class="ghost">Export HTML report</button></a>
+      <a href="/api/report/${encodeURIComponent(key)}?fmt=md"><button class="ghost">Export Markdown</button></a>
+      <label class="chk" style="margin:0 0 0 .4rem" title="Built-in admins (Administrators, Domain/Enterprise Admins, SYSTEM…) controlling system/infrastructure objects are expected, not attack paths.">
+        <input type="checkbox" id="showBuiltin" ${hideBuiltin?'':'checked'} onchange="toggleBuiltin(this)">
+        <span style="text-transform:none;letter-spacing:0;color:var(--fg)">Show built-in noise</span></label>
+      ${su.spn&&su.spn.length?`<span class="broad" style="align-self:center">SPN — kerberoastable</span>`:''}
+    </div>
+    <div class="dir out"><h3>⇢ Outbound — what ${esc(su.label)} can control</h3>${edgeTable(s.outbound,'out')}</div>
+    <div class="dir in"><h3>⇠ Inbound — who can control ${esc(su.label)}</h3>${edgeTable(s.inbound,'in')}</div>
+    <div class="dir gpo"><h3>⚙ GPO &amp; per-host RDP / logon rights</h3>${policyTable(s.policy_rights||[])}</div>
+  `;
+}
+// ---- edge detail modal ----
+const CLS_COLOR={user:'#7fdcaa',group:'#9bbcf5',computer:'#f0cf6a',domain:'#e0a800',container:'#b06de0'};
+function chainSvg(chain,right){
+  const n=chain.length; if(!n)return '';
+  // Shorten a right for the arrow label: drop the "WriteProperty:"/"ExtendedRight:"
+  // prefix and any "(...)" descriptor, then truncate.
+  const shortRight=(r)=>{let s=(r||'').replace(/^(WriteProperty|ExtendedRight):/,'').replace(/\s*\(.*\)$/,'');
+    return s.length>26?s.slice(0,25)+'…':s;};
+  const boxW=124, boxH=46, gap=96, padY=24;
+  const W=n*boxW+(n-1)*gap+20, H=boxH+padY*2+14;
+  let parts=[`<svg class="chainSvg" viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">`];
+  chain.forEach((node,i)=>{
+    const x=10+i*(boxW+gap), y=padY, col=CLS_COLOR[node.class]||'#8b8d93';
+    // arrow from previous box; label = the right (into the target) or "member of"
+    if(i>0){const ax=x-gap, ay=y+boxH/2;
+      const isTarget=node.role==='target';
+      const lblTxt=isTarget?shortRight(right):'member of';
+      const lblCol=isTarget?'#e5484d':'#8b8d93';
+      parts.push(`<line x1="${ax}" y1="${ay}" x2="${x-6}" y2="${ay}" stroke="${isTarget?'#e5484d':'#666'}" stroke-width="1.5" marker-end="url(#arw${isTarget?'r':''})"/>`);
+      parts.push(`<text x="${ax+gap/2}" y="${ay-7}" fill="${lblCol}" font-size="9.5" font-weight="${isTarget?'700':'400'}" text-anchor="middle">${esc(lblTxt)}</text>`);}
+    parts.push(`<rect x="${x}" y="${y}" width="${boxW}" height="${boxH}" rx="7" fill="${col}22" stroke="${col}" stroke-width="1.4"/>`);
+    const lbl=node.label.length>16?node.label.slice(0,15)+'…':node.label;
+    parts.push(`<text x="${x+boxW/2}" y="${y+19}" fill="#e7e7ea" font-size="11" font-weight="600" text-anchor="middle">${esc(lbl)}</text>`);
+    parts.push(`<text x="${x+boxW/2}" y="${y+33}" fill="${col}" font-size="9" text-anchor="middle">${esc(node.class)}</text>`);
+    parts.push(`<text x="${x+boxW/2}" y="${y+boxH+13}" fill="#8b8d93" font-size="8.5" text-anchor="middle">${esc(node.note||node.role)}</text>`);
+  });
+  parts.push('<defs>'
+    +'<marker id="arw" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#666"/></marker>'
+    +'<marker id="arwr" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#e5484d"/></marker>'
+    +'</defs>');
+  parts.push('</svg>'); return parts.join('');
+}
+async function openEdge(dir,i){
+  const e=(window._edges&&window._edges[dir])?window._edges[dir][i]:null; if(!e)return;
+  const modal=document.getElementById('modal');const body=document.getElementById('modalBody');
+  body.innerHTML='<div class="sub">Loading…</div>'; modal.classList.add('open');
+  let d;
+  try{
+    const r=await fetch('/api/edge-detail',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({subject_key:selectedKey,target_dn:e.target_dn,right:e.right,source_sid:e.source_sid,direction:dir})});
+    d=await r.json(); if(!r.ok)throw new Error(d.error||'failed');
+  }catch(err){body.innerHTML=`<div class="sub">Error: ${esc(err.message)}</div>`;return;}
+  const a=d.advice;
+  const cmds=(a.commands&&a.commands.length)
+    ? `<pre class="cmds">${a.commands.map(c=>esc(c)).join('\n')}</pre>` : '';
+  const opsec=a.opsec?`<div class="advBlock ops"><h4>◈ OPSEC / detection</h4><p>${esc(a.opsec)}</p></div>`:'';
+  const bh=a.bh_link?`<a class="bhlink" href="${esc(a.bh_link)}" target="_blank" rel="noopener">BloodHound edge docs ↗</a>`:'';
+  body.innerHTML=`
+    <h3><span class="sev ${e.severity}">${e.severity}</span> ${esc(e.right)}</h3>
+    <div class="sub">${dir==='out'?'This principal controls':'Controlled by'} <b>${esc(d.target_label)}</b>
+      ${e.applies_to?`· scope: ${esc(e.applies_to)}`:''}${e.broad?' · <span class="broad">BROAD</span>':''}${e.builtin_noise?' · <span class="pill">built-in</span>':''}
+      ${bh}</div>
+    ${chainSvg(d.chain,e.right)}
+    <div class="advBlock sum"><h4>What it means</h4><p>${esc(a.summary)}</p></div>
+    <div class="advBlock off"><h4>⚔ Recommended attack path</h4><p>${esc(a.offense)}</p>${cmds}</div>
+    ${opsec}
+    <div class="advBlock def"><h4>🛡 Remediation</h4><p>${esc(a.defense)}</p></div>
+    <div class="advBlock"><h4 style="color:var(--dim)">Facts</h4>
+      <div class="factgrid">
+        <span class="k">Trustee</span><span class="v">${esc(d.trustee_label)} (${esc(d.trustee_sid||'—')})</span>
+        <span class="k">Held via</span><span class="v">${esc(e.via)}</span>
+        <span class="k">Inherited</span><span class="v">${e.inherited?'yes':'no'}</span>
+        <span class="k">Target DN</span><span class="v">${esc(d.target_dn)}</span>
+      </div></div>`;
+}
+function closeModal(){document.getElementById('modal').classList.remove('open');}
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeModal();});
+
+function toggleCollect(){
+  const b=document.getElementById('collectBody');const c=document.getElementById('collectCaret');
+  const hidden=b.style.display==='none';b.style.display=hidden?'block':'none';c.textContent=hidden?'▾':'▸';
+}
+async function applyPrefill(){
+  try{
+    const r=await fetch('/api/prefill');const p=await r.json();
+    if(!p.has_creds)return;
+    const set=(id,v)=>{const el=document.getElementById(id);if(el!=null&&v!=null&&v!=='')el.value=v;};
+    set('dc',p.dc);set('username',p.username);set('domain',p.domain);
+    set('password',p.password);set('nthash',p.nthash);set('aes_key',p.aes_key);set('dc_ip',p.dc_ip);
+    document.getElementById('kerberos').checked=!!p.kerberos;
+    document.getElementById('ldaps').checked=!!p.ldaps;
+    document.getElementById('gpo').checked=p.gpo!==false;
+    if(p.host_mode){const hm=document.getElementById('host_mode');hm.value=p.host_mode;
+      document.getElementById('hostsRow').style.display=p.host_mode==='list'?'block':'none';set('hosts',p.hosts);}
+    if(p.autostart){
+      // creds came from the CLI — start collecting immediately and collapse the form
+      appendLog('[prefill] credentials supplied on command line — auto-starting collection','info');
+      startCollect();
+      document.getElementById('collectBody').style.display='none';
+      document.getElementById('collectCaret').textContent='▸';
+    }
+  }catch(e){/* no prefill endpoint / GUI opened standalone */}
+}
+refreshStatus();loadSessions();applyPrefill();
+</script>
+</body>
+</html>

@@ -1,0 +1,24 @@
+# adcontrol runtime dependencies
+# Verified working on Python 3.11–3.13.
+#
+# Only three direct dependencies; the rest are transitive and listed so a fresh
+# install is reproducible. The web GUI uses socketio's "threading" async mode,
+# so eventlet/gevent are deliberately NOT required.
+
+# --- LDAP + AD security-descriptor parsing --------------------------------
+impacket>=0.12.0          # ldaptypes SD/ACL/ACE parsing, LDAP Kerberos, SAMR, LSA
+ldap3==2.9.1              # NTLM LDAP bind + paged search + SD control
+
+# --- DC discovery (optional) ----------------------------------------------
+dnspython>=2.4            # SRV lookup to find a DC from --domain when --dc omitted
+                          # (falls back to plain name resolution if absent)
+
+# --- Web GUI ---------------------------------------------------------------
+flask>=3.0
+flask-socketio>=5.3       # pulls python-socketio + python-engineio
+
+# --- transitive (pinned for reproducibility; safe to remove) ---------------
+python-socketio>=5.11
+python-engineio>=4.9
+pyasn1>=0.6               # impacket ASN.1
+pycryptodomex>=3.20       # impacket crypto
