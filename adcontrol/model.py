@@ -64,8 +64,10 @@ class PolicyRight:
     GPO-linked container)."""
     plane: str                  # "gpo" | "host"
     right: str                  # e.g. "SeRemoteInteractiveLogonRight (Allow log on through RDP)"
-    trustees: list[str] = field(default_factory=list)   # SIDs or names granted
+    trustees: list[str] = field(default_factory=list)   # resolved display labels granted
+    trustee_sids: list[str] = field(default_factory=list)  # canonical SIDs (parallel to trustees; for SID-based joins)
     applies_to: str = ""        # OU DN / computer / GPO name
+    applies_to_sid: str = ""    # SID of the host/target object when known (for SID-based joins)
     source: str = ""            # GPO display name or host FQDN
     severity: str = "medium"
     detail: str = ""
@@ -91,6 +93,38 @@ class ControlEdge:
     builtin_noise: bool = False  # built-in admin controlling a system/infra object (expected, hideable)
 
 
+@dataclass
+class Session:
+    """A user logged on to a computer at collection time (BloodHound HasSession).
+
+    ``kind`` records the collection method's confidence: 'privileged' (LSASS /
+    high-integrity) and 'registry' (HKU enumeration) are reliable — the user's
+    credentials are actually on the host; 'netsession' (net session enumeration)
+    is looser and can be stale, so it's kept informational and NOT chained into
+    attack paths."""
+    user_sid: str
+    computer_sid: str
+    kind: str = "netsession"    # "privileged" | "registry" | "netsession"
+
+
+@dataclass
+class AdcsFinding:
+    """One ADCS misconfiguration (ESC*) on a certificate template or CA.
+
+    Kept in its own list (``store.adcs_findings``) so it never mixes with the AD
+    object-control graph. ``enrollers`` are the resolved principal labels who can
+    enroll (or, for ESC4, control) the template — the actors who can abuse it."""
+    esc: str                    # "ESC1" | "ESC2" | "ESC3" | "ESC4" | "ESC6" | ...
+    template: str               # template display name
+    template_dn: str = ""
+    severity: str = "high"
+    ca: str = ""                # issuing CA display name (when known)
+    enrollers: list = field(default_factory=list)      # principal labels who can enroll/control
+    enroller_sids: list = field(default_factory=list)  # parallel SIDs (for joins)
+    detail: str = ""            # human explanation of the condition
+    reasons: list = field(default_factory=list)        # the specific flags that made it vulnerable
+
+
 class ObjectStore:
     """All collected objects plus SID/DN indexes and a domain-info record.
 
@@ -102,6 +136,8 @@ class ObjectStore:
         self.objects: dict[str, RawObject] = {}      # keyed by DN (canonical)
         self._by_sid: dict[str, str] = {}            # sid -> dn
         self.policy_rights: list = []                # list[PolicyRight] from GPO/host planes
+        self.sessions: list = []                     # list[Session] user↔host logon sessions
+        self.adcs_findings: list = []                # list[AdcsFinding] ESC* misconfigs
         self.domain: str = ""
         self.domain_sid: str = ""
         self.base_dn: str = ""
@@ -109,6 +145,18 @@ class ObjectStore:
         self.collected_at: str = ""
         self.source: str = "live-ldap"               # or "offline:<kind>"
         self.meta: dict = field(default_factory=dict) if False else {}
+        # Lazily-built session indexes (see build_session_indexes()).
+        self._sessions_on_host: dict = {}            # computer_sid -> list[Session]
+        self._user_sessions: dict = {}               # user_sid -> list[Session]
+
+    def __setstate__(self, state: dict) -> None:
+        """Unpickle-safe: fill in attributes added after a pickle was written so
+        older saved sessions (pre-``sessions`` support) load without AttributeError."""
+        self.__dict__.update(state)
+        self.__dict__.setdefault("sessions", [])
+        self.__dict__.setdefault("adcs_findings", [])
+        self.__dict__.setdefault("_sessions_on_host", {})
+        self.__dict__.setdefault("_user_sessions", {})
 
     # -- population -----------------------------------------------------------
     def add(self, obj: RawObject) -> None:
@@ -148,6 +196,28 @@ class ObjectStore:
         """Objects that can be a chosen subject: users, groups, computers."""
         return [o for o in self.objects.values()
                 if o.object_class in ("user", "group", "computer")]
+
+    # -- sessions -------------------------------------------------------------
+    def build_session_indexes(self) -> None:
+        """(Re)build the host↔user session indexes from ``self.sessions``. Called
+        after population; safe to call repeatedly."""
+        self._sessions_on_host = {}
+        self._user_sessions = {}
+        for s in self.sessions:
+            self._sessions_on_host.setdefault(s.computer_sid, []).append(s)
+            self._user_sessions.setdefault(s.user_sid, []).append(s)
+
+    def sessions_on_host(self, computer_sid: str) -> list:
+        """Sessions (users logged on) for a computer SID."""
+        if self.sessions and not self._sessions_on_host:
+            self.build_session_indexes()
+        return self._sessions_on_host.get(computer_sid, [])
+
+    def sessions_of_user(self, user_sid: str) -> list:
+        """Sessions (hosts) a user is logged on to."""
+        if self.sessions and not self._user_sessions:
+            self.build_session_indexes()
+        return self._user_sessions.get(user_sid, [])
 
     def __len__(self) -> int:
         return len(self.objects)

@@ -241,6 +241,36 @@ def is_builtin_admin_trustee(sid: str) -> bool:
     return sid.startswith("S-1-5-21-") and rid in BUILTIN_ADMIN_RELATIVE
 
 
+# Built-in AD groups whose privileged rights over objects are EXPECTED by design
+# (not a finding). Superset of the admin trustees, adding the Key-Admins groups
+# (526/527) whose whole purpose is writing msDS-KeyCredentialLink, plus Account/
+# Server/Backup/Print Operators. Used to hide "expected" noise by default while
+# a toggle can still reveal it.
+WELLKNOWN_PRIVILEGED_RELATIVE = BUILTIN_ADMIN_RELATIVE | {
+    "526",  # Key Admins            (writes msDS-KeyCredentialLink by design)
+    "527",  # Enterprise Key Admins (same, forest-wide)
+    "517",  # Cert Publishers
+    "520",  # Group Policy Creator Owners
+}
+WELLKNOWN_PRIVILEGED_SIDS = BUILTIN_ADMIN_SIDS | {
+    "S-1-5-32-548",  # Account Operators
+    "S-1-5-32-549",  # Server Operators
+    "S-1-5-32-550",  # Print Operators
+    "S-1-5-32-551",  # Backup Operators
+}
+
+
+def is_wellknown_privileged_group(sid: str) -> bool:
+    """True for a built-in AD group whose privileged control over objects is
+    expected (Domain/Enterprise/Schema Admins, Administrators, Key Admins,
+    operators, …). These are noise in a 'who can take over what' view, so the
+    report hides them by default with a toggle to reveal."""
+    if sid in WELLKNOWN_PRIVILEGED_SIDS:
+        return True
+    rid = sid.rsplit("-", 1)[-1]
+    return sid.startswith("S-1-5-21-") and rid in WELLKNOWN_PRIVILEGED_RELATIVE
+
+
 def wellknown_name(sid: str) -> str | None:
     """Friendly name for a SID from the well-known tables, or None."""
     if sid in WELLKNOWN_SIDS:

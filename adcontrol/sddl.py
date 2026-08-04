@@ -139,6 +139,47 @@ def _resolve_guid_name(guid: str, schema_names: dict) -> str:
     return guid
 
 
+def parse_gmsa_membership(blob: bytes):
+    """Parse an ``msDS-GroupMSAMembership`` security descriptor.
+
+    This attribute is a raw SD whose DACL enumerates the principals permitted to
+    RETRIEVE the gMSA's managed password — i.e. every allowed trustee effectively
+    controls the account. Returns a list of :class:`adcontrol.model.Ace`, one
+    ``ReadGMSAPassword`` grant per allowed trustee (deny ACEs prefixed
+    ``DENY:``). Empty on any parse failure."""
+    if not blob:
+        return []
+    try:
+        sd = ldaptypes.SR_SECURITY_DESCRIPTOR(data=bytes(blob))
+    except Exception:
+        return []
+    dacl = sd["Dacl"]
+    out: list[Ace] = []
+    if not dacl or not getattr(dacl, "aces", None):
+        return out
+    seen = set()
+    for ace in dacl.aces:
+        atype = ace["AceType"]
+        allowed = atype in _ALLOWED_TYPES
+        denied = atype in _DENIED_TYPES
+        if not (allowed or denied):
+            continue
+        try:
+            trustee = _sid_str(ace["Ace"]["Sid"])
+        except Exception:
+            continue
+        if not trustee or trustee in seen:
+            continue
+        seen.add(trustee)
+        out.append(Ace(
+            trustee_sid=trustee,
+            right=("DENY:ReadGMSAPassword" if denied else "ReadGMSAPassword"),
+            severity="high", applies_to="",
+            inherited=bool(int(ace["AceFlags"]) & INHERITED_ACE),
+        ))
+    return out
+
+
 def parse_descriptor(blob: bytes, schema_names: dict | None = None):
     """Parse an nTSecurityDescriptor.
 

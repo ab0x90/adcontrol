@@ -13,8 +13,47 @@ import datetime
 
 from adcontrol.model import RawObject
 from adcontrol.analyze import Analyzer
+from adcontrol.paths import PathFinder
 
 _SEV_COLOR = {"high": "#e5484d", "medium": "#e0a800", "low": "#3a9e6a"}
+
+
+def _compute_paths(store, subject, analyzer):
+    """Shortest attack paths from the subject to the Tier-0 goal set. Returns
+    (already_tier0, [AttackPath]). Reports use short mode — a report is a
+    summary, not an exhaustive enumeration."""
+    pf = PathFinder(analyzer)
+    if pf.already_tier0(subject):
+        return True, []
+    return False, pf.find(subject, mode="short")
+
+
+def _path_chain_text(path):
+    """One-line 'a --Right--> b --Right--> c' rendering of a path."""
+    if not path.hops:
+        return ""
+    parts = [path.hops[0].source_label]
+    for h in path.hops:
+        parts.append(f"--[{h.right}]-->")
+        parts.append(h.target_label)
+    return " ".join(parts)
+
+
+def _session_rows(store, subject):
+    """(other_label, kind, role) for each logon session relevant to the subject:
+    a computer's logged-on users, or a user's hosts. Empty for other classes."""
+    rows = []
+    if subject.object_class == "computer" and subject.sid:
+        for sess in store.sessions_on_host(subject.sid):
+            u = store.by_sid(sess.user_sid)
+            rows.append(((u.label if u else sess.user_sid), sess.kind, "user on host"))
+    elif subject.object_class == "user" and subject.sid:
+        for sess in store.sessions_of_user(subject.sid):
+            c = store.by_sid(sess.computer_sid)
+            rows.append(((c.label if c else sess.computer_sid), sess.kind, "host"))
+    order = {"privileged": 0, "registry": 1, "netsession": 2}
+    rows.sort(key=lambda r: (order.get(r[1], 9), r[0].lower()))
+    return rows
 
 
 def _edge_rows_md(edges, direction):
@@ -56,13 +95,68 @@ def to_markdown(store, subject: RawObject, analyzer: Analyzer | None = None) -> 
     out.append(f"- **Transitive group memberships:** {s['effective_group_count']}")
     if subj["spn"]:
         out.append(f"- **SPNs (kerberoastable):** {', '.join(subj['spn'])}")
+    if subj.get("gmsa"):
+        out.append("- **gMSA** (password retrievable via msDS-GroupMSAMembership)")
+    if subj.get("flags"):
+        out.append(f"- **Account flags:** {', '.join(subj['flags'])}")
     out.append("")
     out.append(f"## Outbound control — what {subj['label']} can control  "
                f"({len(s['outbound'])} edges, {s['outbound_high']} high)\n")
     out.append(_edge_rows_md(s["outbound"], "out"))
+    already, paths = _compute_paths(store, subject, analyzer)
+    out.append(f"\n## Attack paths to Tier-0  ({len(paths)})\n")
+    out.append("_Multi-hop control chains from this principal to Domain/Enterprise "
+               "Admins or the domain root. Each hop is a control edge pivoted "
+               "through (controlling a principal lets you act as it). Shortest "
+               "path per target._\n")
+    if already:
+        out.append("_This principal is already Tier-0 (effectively Domain/Enterprise "
+                   "Admin), so there is no path to *reach* Tier-0._\n")
+    elif not paths:
+        out.append("_No control path to Tier-0 found from this principal._\n")
+    else:
+        for p in paths:
+            out.append(f"- **{p.length} hop{'' if p.length == 1 else 's'} → {p.win}:** "
+                       f"{_path_chain_text(p)}")
+        out.append("")
     out.append(f"\n## Inbound control — who can control {subj['label']}  "
                f"({len(s['inbound'])} edges, {s['inbound_high']} high)\n")
     out.append(_edge_rows_md(s["inbound"], "in"))
+    sess = _session_rows(store, subject)
+    if subject.object_class in ("user", "computer"):
+        out.append(f"\n## Logon sessions  ({len(sess)})\n")
+        out.append("_" + ("Users logged on to this host" if subject.object_class == "computer"
+                          else "Hosts this user is logged on to")
+                   + " at collection time. Privileged/registry sessions are reliable "
+                     "credential-theft opportunities; net-sessions can be stale._\n")
+        if sess:
+            lines = ["| Confidence | " + ("User" if subject.object_class == "computer" else "Host") + " |",
+                     "|---|---|"]
+            for label, kind, _role in sess:
+                lines.append(f"| {kind} | {label} |")
+            out.append("\n".join(lines) + "\n")
+        else:
+            out.append("_No sessions collected._\n")
+    reach = s["local_admin_rdp"]
+    if subject.object_class in ("user", "computer") and (reach["local_admin"] or reach["rdp"]):
+        out.append(f"\n## 🔑 Local Admin access  ({len(reach['local_admin'])})\n")
+        out.append("_Systems where this principal — directly or through a group — is a "
+                   "member of local Administrators. **Via** = direct or which group._\n")
+        out.append(_reach_rows_md(reach["local_admin"], "Local admin"))
+        out.append(f"\n## 🖥 RDP access  ({len(reach['rdp'])})\n")
+        out.append("_Systems this principal can log on to via RDP (Remote Desktop Users "
+                   "or SeRemoteInteractiveLogonRight)._\n")
+        out.append(_reach_rows_md(reach["rdp"], "RDP access"))
+    if s.get("adcs"):
+        out.append(f"\n## 🎗 ADCS certificate abuse (ESC)  ({len(s['adcs'])})\n")
+        out.append("_Vulnerable certificate templates this principal (or a group it "
+                   "belongs to) can enroll or control._\n")
+        out.append("| ESC | Template | Why it works | Conditions |")
+        out.append("|---|---|---|---|")
+        for f in s["adcs"]:
+            out.append(f"| {f['esc']} | {f['template']} | {f['detail']} | "
+                       f"{', '.join(f.get('reasons', []))} |")
+        out.append("")
     out.append(f"\n## GPO-delivered & per-host RDP / logon rights  "
                f"({len(s['policy_rights'])})\n")
     out.append("_Rights this principal (or a group it belongs to) gains from "
@@ -93,6 +187,125 @@ def _edge_rows_html(edges, direction):
             f'<tbody>{"".join(rows)}</tbody></table>')
 
 
+def _sessions_html(store, subject):
+    sess = _session_rows(store, subject)
+    head = "User" if subject.object_class == "computer" else "Host"
+    if not sess:
+        return '<p class="none">No logon sessions collected.</p>'
+    rows = []
+    for label, kind, _role in sess:
+        cls = "broad" if kind == "privileged" else "pill"
+        rows.append(f'<tr><td><span class="{cls}">{html.escape(kind)}</span></td>'
+                    f'<td>{html.escape(label)}</td></tr>')
+    return (f'<table><thead><tr><th>Confidence</th><th>{head}</th></tr></thead>'
+            f'<tbody>{"".join(rows)}</tbody></table>')
+
+
+def _sessions_section_html(store, subject):
+    """Full <h2> sessions section, or empty for non-principal subjects."""
+    if subject.object_class not in ("user", "computer"):
+        return ""
+    lead = ("Users logged on to this host" if subject.object_class == "computer"
+            else "Hosts this user is logged on to")
+    return ('<h2>Logon sessions</h2>'
+            f'<p class="meta">{lead} at collection time. Privileged/registry '
+            'sessions are reliable credential-theft opportunities; net-sessions '
+            'can be stale.</p>'
+            '<div class="tableWrap">' + _sessions_html(store, subject) + '</div>')
+
+
+def _paths_html(already, paths):
+    if already:
+        return ('<p class="none">This principal is already Tier-0 (effectively '
+                'Domain/Enterprise Admin), so there is no path to <i>reach</i> Tier-0.</p>')
+    if not paths:
+        return '<p class="none">No control path to Tier-0 found from this principal.</p>'
+    cards = []
+    for p in paths:
+        chain = []
+        if p.hops:
+            chain.append(f'<span class="pnode">{html.escape(p.hops[0].source_label)}</span>')
+            for h in p.hops:
+                right = html.escape(h.right)
+                color = _SEV_COLOR.get(h.severity, "#888")
+                chain.append(f'<span class="parrow">→ <span class="prt" '
+                             f'style="color:{color}">{right}</span> →</span>')
+                chain.append(f'<span class="pnode">{html.escape(h.target_label)}</span>')
+        hops = p.length
+        cards.append(
+            f'<div class="pathcard"><div class="pathmeta">'
+            f'<span class="pill">{hops} hop{"" if hops == 1 else "s"}</span> '
+            f'<span class="winbadge">WIN → {html.escape(p.win)}</span></div>'
+            f'<div class="pathchain">{"".join(chain)}</div></div>')
+    return "".join(cards)
+
+
+def _reach_rows_html(rows, host_head):
+    if not rows:
+        return f'<p class="none">None — subject has no {host_head.lower()} to any collected host.</p>'
+    body = []
+    for r in rows:
+        via = html.escape(r["via"])
+        via_cls = "reachdirect" if r["via"] == "direct" else "pill"
+        color = _SEV_COLOR.get(r["severity"], "#888")
+        body.append(
+            f'<tr><td class="right">{html.escape(r["host"])}</td>'
+            f'<td><span class="{via_cls}">{via}</span></td>'
+            f'<td><span class="sev" style="background:{color}">{html.escape(r["severity"])}</span></td>'
+            f'<td class="scope">{html.escape(r["right"])}</td></tr>')
+    return ('<table><thead><tr><th>System</th><th>Via</th><th>Severity</th>'
+            f'<th>Grant</th></tr></thead><tbody>{"".join(body)}</tbody></table>')
+
+
+def _reach_section_html(subject, reach):
+    """Local Admin + RDP reach tables — user/computer subjects only."""
+    if subject.object_class not in ("user", "computer"):
+        return ""
+    la, rdp = reach["local_admin"], reach["rdp"]
+    if not la and not rdp:
+        return ""
+    return ('<h2>🔑 Local Admin access</h2>'
+            '<p class="meta">Systems where this principal — directly or through a '
+            'group it belongs to — is a member of local Administrators. '
+            '<b>Via</b> shows whether the access is direct or inherited from a group.</p>'
+            '<div class="tableWrap">' + _reach_rows_html(la, "Local admin") + '</div>'
+            '<h2>🖥 RDP access</h2>'
+            '<p class="meta">Systems this principal can log on to via RDP (Remote '
+            'Desktop Users membership or the SeRemoteInteractiveLogonRight user-right).</p>'
+            '<div class="tableWrap">' + _reach_rows_html(rdp, "RDP access") + '</div>')
+
+
+def _adcs_section_html(adcs):
+    """ADCS ESC abuse section — only when the subject can abuse a vuln template."""
+    if not adcs:
+        return ""
+    rows = []
+    for f in adcs:
+        color = _SEV_COLOR.get(f["severity"], "#888")
+        reasons = html.escape(", ".join(f.get("reasons", [])))
+        rows.append(
+            f'<tr><td><span class="sev" style="background:{color}">{html.escape(f["esc"])}</span></td>'
+            f'<td class="right">{html.escape(f["template"])}</td>'
+            f'<td>{html.escape(f["detail"])}</td>'
+            f'<td class="scope">{reasons}</td></tr>')
+    return ('<h2>🎗 ADCS certificate abuse (ESC)</h2>'
+            '<p class="meta">Vulnerable certificate templates this principal (or a '
+            'group it belongs to) can enroll or control — a path to authentication '
+            'as another identity via AD Certificate Services.</p>'
+            '<div class="tableWrap"><table><thead><tr><th>ESC</th><th>Template</th>'
+            '<th>Why it works</th><th>Conditions</th></tr></thead><tbody>'
+            + "".join(rows) + '</tbody></table></div>')
+
+
+def _reach_rows_md(rows, host_head):
+    if not rows:
+        return f"_None — no {host_head.lower()} to any collected host._\n"
+    lines = ["| System | Via | Severity | Grant |", "|---|---|---|---|"]
+    for r in rows:
+        lines.append(f"| {r['host']} | {r['via']} | {r['severity']} | {r['right']} |")
+    return "\n".join(lines) + "\n"
+
+
 def _policy_rows_html(policy_rights):
     if not policy_rights:
         return '<p class="none">None found (or GPO/host planes not collected).</p>'
@@ -118,6 +331,14 @@ def to_html(store, subject: RawObject, analyzer: Analyzer | None = None) -> str:
     subj = s["subject"]
     now = datetime.datetime.now().isoformat(timespec="seconds")
     spn = ("<p><b>SPNs (kerberoastable):</b> " + html.escape(", ".join(subj["spn"])) + "</p>") if subj["spn"] else ""
+    badges = []
+    if subj.get("gmsa"):
+        badges.append('<span class="pill" title="Group Managed Service Account">gMSA</span>')
+    if subj.get("materialized"):
+        badges.append('<span class="pill" title="Reconstructed from host-plane membership — not collected as its own AD object">reconstructed</span>')
+    for fl in subj.get("flags", []):
+        badges.append(f'<span class="pill">{html.escape(fl)}</span>')
+    badges_html = ("<p>" + " ".join(badges) + "</p>") if badges else ""
     extra = ('<h2>GPO-delivered &amp; per-host RDP / logon rights</h2>'
              '<p class="meta">Rights this principal (or a group it belongs to) '
              'gains from Group Policy or local host membership — separate from '
@@ -151,6 +372,16 @@ th{{background:#f3f3f5;font-weight:600}}
 @media(prefers-color-scheme:dark){{.card{{background:#1d1d20}}}}
 .card b{{display:block;font-size:1.7rem;line-height:1}}
 .tableWrap{{overflow-x:auto}}
+.pathcard{{background:#fff;border-radius:8px;border-left:3px solid #e5484d;padding:.7rem .9rem;margin:.5rem 0;box-shadow:0 1px 3px #0002}}
+@media(prefers-color-scheme:dark){{.pathcard{{background:#1d1d20}}}}
+.pathmeta{{display:flex;align-items:center;gap:.6rem;margin-bottom:.5rem}}
+.winbadge{{font-weight:700;color:#e5484d;font-size:.85rem}}
+.pathchain{{display:flex;flex-wrap:wrap;align-items:center;gap:.25rem;line-height:2}}
+.pnode{{padding:.12em .55em;border:1px solid #8884;border-radius:5px;font-weight:600;background:#8881;white-space:nowrap}}
+.parrow{{color:#888;white-space:nowrap}}
+.prt{{font-size:.72rem;font-weight:700}}
+.reachdirect{{font-size:.68rem;text-transform:uppercase;padding:.1em .5em;border-radius:99px;
+  background:#e5484d;color:#fff;font-weight:700}}
 </style></head><body>
 <h1>Control report — {html.escape(subj['label'])}</h1>
 <div class="meta">Generated {now} · source {html.escape(store.source)} · domain <code>{html.escape(store.domain)}</code></div>
@@ -165,10 +396,19 @@ th{{background:#f3f3f5;font-weight:600}}
 <p><b>DN:</b> <code>{html.escape(subj['dn'])}</code><br>
 <b>SID:</b> <code>{html.escape(subj['sid'])}</code><br>
 <b>Class:</b> {html.escape(subj['class'])} · <b>Enabled:</b> {subj['enabled']} · <b>adminCount:</b> {subj['admin_count']}</p>
+{badges_html}
 {spn}
 <h2>Outbound control — what {html.escape(subj['label'])} can control</h2>
 <div class="tableWrap">{_edge_rows_html(s['outbound'], 'out')}</div>
+<h2>Attack paths to Tier-0</h2>
+<p class="meta">Multi-hop control chains from this principal to Domain/Enterprise
+Admins or the domain root. Each hop is a control edge pivoted through —
+controlling a principal lets you act as it. Shortest path per target.</p>
+{_paths_html(*_compute_paths(store, subject, analyzer))}
 <h2>Inbound control — who can control {html.escape(subj['label'])}</h2>
 <div class="tableWrap">{_edge_rows_html(s['inbound'], 'in')}</div>
+{_reach_section_html(subject, s['local_admin_rdp'])}
+{_adcs_section_html(s['adcs'])}
+{_sessions_section_html(store, subject)}
 {extra}
 </body></html>"""

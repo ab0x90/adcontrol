@@ -29,6 +29,24 @@ same outbound/inbound analysis, reports, and modal detail with no domain contact
   into is correctly attributed to the user, with the group path shown.
 - **DCSync detection** — synthesizes a single `DCSync` finding when a principal
   holds both `DS-Replication-Get-Changes` and `-Get-Changes-All` on the domain head.
+- **ADCS (Certificate Services) analysis** — detects the classic ESC1–ESC4
+  template misconfigurations (enrollee-suppliable SAN, Any-Purpose EKU,
+  enrollment-agent templates, writable template objects), folded into the
+  same outbound/inbound control model.
+- **Attack-path chaining** — "how does principal A reach Domain Admin?"
+  Chains one-hop control edges into full multi-hop paths, with a fast
+  shortest-path mode and a fuller (slower) exhaustive-enumeration mode.
+- **Canned queries panel** — pre-built domain-wide investigative queries
+  (e.g. "which non-admin users can control something") without clicking
+  through every principal by hand.
+- **Domain-wide static report** (`--offline`) — a single self-contained HTML
+  file combining the canned queries, shortest paths to Tier-0, and every
+  principal's outbound/inbound control, for domains too large to comfortably
+  browse in the live GUI.
+- **Live logon-session collection** (tier 3, opt-in) — enumerates who's
+  logged on to member hosts via NetWkstaUserEnum/NetSessionEnum, feeding
+  `HasSession` edges into attack-path chaining on a live pull (BloodHound's
+  session-collection loop, for live collection).
 - **Broad-trustee flagging** — control granted to Everyone / Authenticated Users /
   Domain Users is highlighted (it effectively means *every* user has it).
 - **Three collection tiers** with explicit blast-radius control (see below).
@@ -39,7 +57,8 @@ same outbound/inbound analysis, reports, and modal detail with no domain contact
 - **Auth**: password, pass-the-hash (NT hash), or Kerberos (with automatic TGT);
   plain LDAP with automatic fallback to LDAPS.
 - **Offline-ready internals** — all analysis reads a normalized object store, so
-  an offline-dump parser can be added without touching the analysis engine.
+  an offline-dump parser (or a live BloodHound/SharpHound zip/json import via
+  `--bloodhound`) works through the exact same analysis engine.
 
 ---
 
@@ -58,6 +77,11 @@ Tier 2 reads GPO-delivered rights without ever leaving the DC, because GPOs live
 in `SYSVOL`. Only **tier 3** fans out to member hosts, and it does nothing unless
 you explicitly ask for it with `--host-rights` (all collected computers) or
 `--hosts <list>` (only the hosts you name).
+
+Tier 3 also covers live logon-session collection — `--sessions` (all collected
+computers) or `--session-hosts <list>` — which enumerates who's logged on to
+each host via NetWkstaUserEnum/NetSessionEnum and feeds `HasSession` edges into
+attack-path chaining, the same way BloodHound's session loop does.
 
 GPO/host findings are kept in their own section and never mixed into the
 AD-object control graph.
@@ -139,6 +163,25 @@ python3 adcontrol.py --dc dc01.corp.local -u user -p 'Password1' -d corp.local \
 python3 adcontrol.py --dc dc01.corp.local -u user -p 'Password1' -d corp.local --no-gpo
 ```
 
+### Live logon-session collection (tier 3 — opt-in, enables HasSession paths)
+
+```bash
+python3 adcontrol.py --dc dc01.corp.local -u user -p 'Password1' -d corp.local \
+    --session-hosts ws01.corp.local,srv02.corp.local
+```
+
+### Offline: import a BloodHound/SharpHound collection
+
+```bash
+# Same outbound/inbound analysis, GUI, and reports as a live pull — no domain contact
+python3 adcontrol.py --bloodhound collection.zip
+
+# Strictly offline: skip the GUI, write one self-contained domain-wide HTML
+# report (canned queries + shortest paths to Tier-0 + every principal's
+# control) — for domains too large to browse comfortably in the live GUI
+python3 adcontrol.py --bloodhound collection.zip --offline
+```
+
 ### Key options
 
 ```
@@ -154,9 +197,14 @@ python3 adcontrol.py --dc dc01.corp.local -u user -p 'Password1' -d corp.local -
 --no-gpo             Skip tier 2 (GPO plane)
 --host-rights        Tier 3 against ALL collected computers
 --hosts SPEC         Tier 3 against a file / single host / comma-separated list
+--sessions           Tier 3: live logon-session enumeration against ALL collected computers
+--session-hosts SPEC Tier 3: live logon-session enumeration against a file / single host / comma-separated list
+--bloodhound PATH    Offline: import a BloodHound zip/json/directory instead of scanning live
+--offline            With --bloodhound: skip the GUI, write one domain-wide HTML report, exit
 --nogui              CLI only
 --subject NAME       (CLI) principal to analyze
---report PATH        (CLI) write report (.html or .md)
+--report PATH        (CLI) write report (.html or .md); with --offline, overrides the
+                     default adcontrol_<DOMAIN>_<timestamp>.html path
 --port N             GUI port (default 5006)
 ```
 
@@ -174,13 +222,19 @@ adcontrol/
   collector.py          Pulls objects + security descriptors into the object store
   sddl.py               nTSecurityDescriptor parser → named rights
   rights.py             Access-mask + extended-right/GUID → right-name maps, well-known SIDs
-  model.py              Normalized object store (the seam for future offline dumps)
+  model.py              Normalized object store (the seam for offline dumps)
+  bloodhound.py         Offline import of a BloodHound/SharpHound zip/json/directory
   graph.py              Transitive group-membership resolution
   analyze.py            Outbound + inbound control edges (kept separate) + DCSync synthesis
+  adcs.py               ADCS template analysis — ESC1–ESC4 misconfiguration detection
+  paths.py              Multi-hop attack-path chaining over the control graph (shortest / full)
+  queries.py            Canned domain-wide queries for the GUI's Queries panel
   gpo.py                Tier 2 — GPO rights from the DC's SYSVOL
   hostrights.py         Tier 3 — per-host RDP/admin via SAMR + LSA
+  sessions.py           Tier 3 — live logon-session collection via SAMR/wkssvc/srvsvc
   smbauth.py            Shared SMB/DCE-RPC credential helper for tiers 2 & 3
-  report.py             Scoped HTML / Markdown report export
+  report.py             Scoped HTML / Markdown report export (single principal)
+  report_domain.py      Domain-wide static HTML report (--offline)
   app.py                Flask + SocketIO web server + REST API
   templates/index.html  Single-page web GUI
 ```

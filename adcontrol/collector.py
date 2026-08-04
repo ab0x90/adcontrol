@@ -23,16 +23,36 @@ _ATTRS = [
     "member", "memberOf", "gPLink", "adminCount", "userAccountControl",
     "servicePrincipalName", "msDS-AllowedToActOnBehalfOfOtherIdentity",
     "operatingSystem", "gPCFileSysPath", "dNSHostName",
+    # gMSA password-retrieval principals (an SD blob, parsed like nTSecurityDescriptor).
+    "msDS-GroupMSAMembership", "sAMAccountType",
+    # delegation / staleness / creds-in-description (analysis extras).
+    "msDS-AllowedToDelegateTo", "sIDHistory", "description",
+    "pwdLastSet", "lastLogonTimestamp",
+    # ADCS certificate-template attributes (ESC1-ESC3 conditions).
+    "msPKI-Certificate-Name-Flag", "msPKI-Enrollment-Flag", "msPKI-RA-Signature",
+    "msPKI-Template-Schema-Version", "pKIExtendedKeyUsage",
+    "msPKI-Certificate-Application-Policy",
 ]
 
 # One filter that captures every principal + container we care about controlling.
+# Includes (group) managed service accounts — they are principals that can be
+# local admin / hold SPNs / be granted rights, and their msDS-GroupMSAMembership
+# SD is a first-class control edge (who can retrieve the gMSA password).
 _MAIN_FILTER = (
     "(|(objectClass=user)(objectClass=group)(objectClass=computer)"
     "(objectClass=organizationalUnit)(objectClass=groupPolicyContainer)"
-    "(objectClass=domain)(objectClass=container))"
+    "(objectClass=domain)(objectClass=container)"
+    "(objectClass=msDS-GroupManagedServiceAccount)"
+    "(objectClass=msDS-ManagedServiceAccount))"
 )
 
 _UAC_DISABLED = 0x0002
+# UAC flags worth surfacing for delegation analysis.
+_UAC_TRUSTED_FOR_DELEGATION = 0x80000        # unconstrained delegation
+_UAC_TRUSTED_TO_AUTH_FOR_DELEGATION = 0x1000000  # constrained w/ protocol transition
+_UAC_DONT_REQ_PREAUTH = 0x400000             # AS-REP roastable
+_SAT_GMSA = 0x30000001
+_SAT_SMSA = 0x30000000
 
 
 def _first(rec, *keys, default=""):
@@ -50,9 +70,18 @@ def _as_list(v):
 
 
 def _most_specific_class(classes) -> str:
+    cl = {str(c).lower() for c in classes}
+    # (Group) managed service accounts derive from computer but are principals we
+    # want treated as user-like (local admin, SPNs, granted rights). Classify
+    # them first so the computer base-class doesn't win.
+    if "msds-groupmanagedserviceaccount" in cl or "msds-managedserviceaccount" in cl:
+        return "user"
+    if "pkicertificatetemplate" in cl:
+        return "pKICertificateTemplate"
+    if "pkienrollmentservice" in cl:
+        return "pKIEnrollmentService"
     order = ["computer", "user", "group", "organizationalUnit",
              "groupPolicyContainer", "domain", "container"]
-    cl = {str(c).lower() for c in classes}
     mapping = {
         "computer": "computer", "user": "user", "group": "group",
         "organizationalunit": "organizationalUnit",
@@ -102,6 +131,52 @@ def collect_schema_guids(client) -> dict:
     return names
 
 
+def collect_adcs(client, store, log=None) -> int:
+    """Collect ADCS certificate templates + enrollment services (CAs) from the
+    Configuration NC's PKI container, with their DACLs, and normalize each
+    template's ESC-relevant attributes into ``obj.extra['adcs_template']``.
+
+    Returns the number of ADCS objects added. Best-effort: if the PKI container
+    isn't present (no ADCS) it logs and returns 0.
+    """
+    log = log or client.log
+    from adcontrol import adcs as adcs_mod
+    pki_base = (f"CN=Public Key Services,CN=Services,CN=Configuration,"
+                f"{_root_dn(client.base_dn)}")
+    flt = ("(|(objectClass=pKICertificateTemplate)"
+           "(objectClass=pKIEnrollmentService)(objectClass=certificationAuthority))")
+    attrs = _ATTRS  # includes the msPKI-* template attributes
+    added = 0
+    try:
+        recs = list(client.search(flt, attrs, base=pki_base, want_sd=True))
+    except Exception as e:
+        log(f"[adcs] PKI container search skipped ({e})", "info")
+        return 0
+    for rec in recs:
+        dn = rec.get("dn") or _first(rec, "distinguishedName")
+        if not dn:
+            continue
+        classes = _as_list(rec.get("objectClass"))
+        obj = RawObject(
+            dn=dn, sid=_first(rec, "objectSid"), guid=_first(rec, "objectGUID"),
+            sam=_first(rec, "sAMAccountName"),
+            name=_first(rec, "displayName", "cn", "name"),
+            object_class=_most_specific_class(classes),
+            classes=[str(c) for c in classes],
+        )
+        blob = rec.get("nTSecurityDescriptor")
+        if blob:
+            owner, aces = sddl.parse_descriptor(blob, store.schema_guid_names)
+            obj.owner_sid = owner
+            obj.aces = aces
+        if obj.object_class == "pKICertificateTemplate":
+            obj.extra["adcs_template"] = adcs_mod.normalize_from_ldap(rec, _first)
+        store.add(obj)
+        added += 1
+    log(f"[adcs] collected {added} certificate template/CA object(s)", "info")
+    return added
+
+
 def _root_dn(base_dn: str) -> str:
     """Strip any leading CN=/OU= components to get the DC=... root."""
     parts = [p for p in base_dn.split(",") if p.strip().upper().startswith("DC=")]
@@ -109,7 +184,7 @@ def _root_dn(base_dn: str) -> str:
 
 
 def collect(client, log=None, smb_creds=None, dc_host=None, dc_ip=None,
-            do_gpo=True, host_targets=None) -> ObjectStore:
+            do_gpo=True, host_targets=None, session_targets=None) -> ObjectStore:
     """Collect the AD object graph (tier 1), then optionally the GPO plane
     (tier 2, on by default when *smb_creds* is supplied) and the per-host plane
     (tier 3, only when *host_targets* is a non-empty list).
@@ -176,6 +251,36 @@ def collect(client, log=None, smb_creds=None, dc_host=None, dc_ip=None,
             obj.owner_sid = owner
             obj.aces = aces
 
+        # gMSA: mark it and turn its msDS-GroupMSAMembership SD into
+        # ReadGMSAPassword control edges (who can retrieve its password).
+        cl_low = {str(c).lower() for c in classes}
+        if "msds-groupmanagedserviceaccount" in cl_low or "msds-managedserviceaccount" in cl_low:
+            obj.extra["gmsa"] = True
+        gmsa_sd = rec.get("msDS-GroupMSAMembership")
+        if gmsa_sd:
+            obj.aces.extend(sddl.parse_gmsa_membership(gmsa_sd))
+            obj.extra["gmsa"] = True
+
+        # Delegation flags (from UAC + msDS-AllowedToDelegateTo).
+        if obj.uac & _UAC_TRUSTED_FOR_DELEGATION:
+            obj.extra["unconstrained_delegation"] = True
+        if obj.uac & _UAC_TRUSTED_TO_AUTH_FOR_DELEGATION:
+            obj.extra["constrained_delegation_protocol_transition"] = True
+        if obj.uac & _UAC_DONT_REQ_PREAUTH:
+            obj.extra["asrep_roastable"] = True
+        s2d = _as_list(rec.get("msDS-AllowedToDelegateTo"))
+        if s2d:
+            obj.extra["allowed_to_delegate_to"] = [str(x) for x in s2d]
+        # SID history — a live SID-history injection surface.
+        sidhist = _as_list(rec.get("sIDHistory"))
+        if sidhist:
+            obj.extra["sid_history"] = [sddl._sid_str(x) if isinstance(x, (bytes, bytearray))
+                                        else str(x) for x in sidhist]
+        # Description often holds credentials in the wild.
+        desc = _first(rec, "description")
+        if desc:
+            obj.extra["description"] = str(desc)
+
         store.add(obj)
         count += 1
         if count % 500 == 0:
@@ -194,6 +299,12 @@ def collect(client, log=None, smb_creds=None, dc_host=None, dc_ip=None,
 
     log(f"[collect] done: {count} objects, domain SID {store.domain_sid or '?'}", "info")
 
+    # -- ADCS objects (tier 1, DC-only LDAP over the Configuration NC) ---------
+    try:
+        collect_adcs(client, store, log=log)
+    except Exception as e:
+        log(f"[adcs] collection failed: {e}", "warn")
+
     # -- tier 2: GPO plane (DC SYSVOL only) -----------------------------------
     if smb_creds is not None and do_gpo and dc_host:
         try:
@@ -209,6 +320,14 @@ def collect(client, log=None, smb_creds=None, dc_host=None, dc_ip=None,
             hr_mod.collect_host_rights(store, smb_creds, host_targets, log=log)
         except Exception as e:
             log(f"[host] plane failed: {e}", "warn")
+
+    # -- tier 3: live logon-session plane (opt-in, fans out) ------------------
+    if smb_creds is not None and session_targets:
+        try:
+            from adcontrol import sessions as sess_mod
+            sess_mod.collect_sessions(store, smb_creds, session_targets, log=log)
+        except Exception as e:
+            log(f"[sess] plane failed: {e}", "warn")
 
     return store
 

@@ -1,1 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
 
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Runtime data — collected AD sessions are pickles (do not commit; can be large
+# and contain domain data). Recreated at runtime.
+adcontrol_sessions/
+*.pkl
+
+# Exported reports
+*.report.html
+reports/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store

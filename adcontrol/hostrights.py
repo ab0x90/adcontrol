@@ -95,6 +95,20 @@ def _resolve(store, sid):
     return R.wellknown_name(sid) or sid
 
 
+def _host_sid(store, host):
+    """SID of the computer object matching *host* (by dns/sam), or '' if unknown."""
+    hl = (host or "").lower()
+    short = hl.split(".", 1)[0]
+    for obj in store.objects.values():
+        if obj.object_class != "computer":
+            continue
+        dns = (obj.extra.get("dns") or "").lower()
+        sam = (obj.sam.rstrip("$").lower() if obj.sam else "")
+        if hl and (dns == hl or sam == short):
+            return obj.sid or ""
+    return ""
+
+
 def collect_host_rights(store, smb_creds, hosts, log=None):
     """Query each host in *hosts* and append PolicyRight(plane='host') findings.
 
@@ -111,15 +125,16 @@ def collect_host_rights(store, smb_creds, hosts, log=None):
         smb = smb_creds.connect(host, ip)
         if not smb:
             continue
+        host_sid = _host_sid(store, host)
         # SAMR local group membership.
         for rid, sids in _samr_local_members(smb, host, log).items():
             if not sids:
                 continue
             store.policy_rights.append(PolicyRight(
                 plane="host", right=f"Local {_ALIAS_LABELS[rid]}",
-                trustees=[_resolve(store, s) for s in sids],
-                applies_to=host, source=host, severity=_ALIAS_SEV[rid],
-                detail="SAMR local alias membership"))
+                trustees=[_resolve(store, s) for s in sids], trustee_sids=list(sids),
+                applies_to=host, applies_to_sid=host_sid, source=host,
+                severity=_ALIAS_SEV[rid], detail="SAMR local alias membership"))
             added += 1
         # LSA user rights.
         lsa = _lsa_user_rights(smb, host, log)
@@ -129,8 +144,8 @@ def collect_host_rights(store, smb_creds, hosts, log=None):
                 continue
             store.policy_rights.append(PolicyRight(
                 plane="host", right=f"{const} ({friendly})",
-                trustees=[_resolve(store, s) for s in sids],
-                applies_to=host, source=host, severity=sev,
+                trustees=[_resolve(store, s) for s in sids], trustee_sids=list(sids),
+                applies_to=host, applies_to_sid=host_sid, source=host, severity=sev,
                 detail="LSA user-rights assignment"))
             added += 1
         try:

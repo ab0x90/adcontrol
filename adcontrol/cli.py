@@ -72,7 +72,7 @@ def cli_mode(args):
     do_gpo = not args.no_gpo
     host_targets = None
     smb_creds = None
-    if do_gpo or args.host_rights or args.hosts:
+    if do_gpo or args.host_rights or args.hosts or args.sessions or args.session_hosts:
         smb_creds = SmbCreds(username=args.username, password=args.password or "",
                              domain=client.domain, nthash=args.nthash or "",
                              use_kerberos=args.kerberos, aes_key=args.aes_key or "",
@@ -92,7 +92,48 @@ def cli_mode(args):
     if host_targets and smb_creds:
         hr_mod.collect_host_rights(store, smb_creds, host_targets, log=_log)
 
+    # Tier 3 live logon-session plane (opt-in). --sessions = all computers,
+    # --session-hosts <spec> = a named list. Reuses the host-target resolvers.
+    session_targets = None
+    if args.session_hosts:
+        session_targets = hr_mod.hosts_from_spec(args.session_hosts)
+    elif args.sessions:
+        session_targets = hr_mod.hosts_from_store(store)
+    if session_targets and smb_creds:
+        from adcontrol import sessions as sess_mod
+        sess_mod.collect_sessions(store, smb_creds, session_targets, log=_log)
+
     _analyze_store(store, args)
+
+
+def _offline_domain_report(store, args):
+    """Strictly-offline whole-domain HTML report (no GUI). For very large domains
+    where the live web GUI lags. Auto-names the output unless --report is given."""
+    import time
+    import datetime
+    from adcontrol import report_domain
+
+    if args.report:
+        path = args.report
+    else:
+        safe_domain = (store.domain or "domain").replace(" ", "_")
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = f"adcontrol_{safe_domain}_{stamp}.html"
+
+    print(f"[offline] parsed {len(store)} objects / {len(store.principals())} "
+          f"principals from {args.bloodhound}")
+    print("[offline] building domain-wide report (summary + queries + Tier-0 paths "
+          "+ per-principal control)…")
+    t0 = time.time()
+    # Per-principal detail is lazy-rendered client-side, so every edge-bearing
+    # principal is always included regardless of domain size (no cap needed).
+    body = report_domain.to_html(store)
+    with open(path, "w") as fh:
+        fh.write(body)
+    dt = time.time() - t0
+    size_mb = len(body) / 1_000_000
+    print(f"[offline] report written: {path}  ({size_mb:.1f} MB, {dt:.1f}s)")
+    print(f"[offline] open it in a browser — no server needed.")
 
 
 def _analyze_store(store, args):
@@ -112,6 +153,11 @@ def _analyze_store(store, args):
         sys.exit(f"no principal matching '{args.subject}'")
     subj = matches[0]
     az = Analyzer(store)
+    try:
+        from adcontrol import adcs as adcs_mod
+        adcs_mod.analyze_adcs(store, az, log=_log)
+    except Exception as e:
+        _log(f"[adcs] analysis skipped: {e}", "warn")
     s = az.summarize(subj)
     print(f"\n=== {subj.label} ({subj.object_class}) ===")
     print(f"Outbound: {len(s['outbound'])} edges ({s['outbound_high']} high) | "
@@ -160,7 +206,25 @@ def main():
     p.add_argument("--hosts", dest="hosts",
                    help="Tier 3: query only these hosts (file, single host, or "
                         "comma-separated list). Overrides --host-rights scope.")
+    p.add_argument("--sessions", dest="sessions", action="store_true",
+                   help="Tier 3: enumerate live logon sessions on ALL collected "
+                        "computers via NetWkstaUserEnum+NetSessionEnum (fans out — "
+                        "enables HasSession attack paths on a live pull).")
+    p.add_argument("--session-hosts", dest="session_hosts",
+                   help="Tier 3: enumerate logon sessions only on these hosts "
+                        "(file, single host, or comma-separated list). Overrides "
+                        "--sessions scope.")
     p.add_argument("--nogui", action="store_true", help="CLI only, no web server")
+    p.add_argument("--offline", action="store_true",
+                   help="Strictly offline: parse the --bloodhound data and write a "
+                        "whole-domain HTML report (summary + queries + Tier-0 paths + "
+                        "per-principal control), then exit. No web GUI — for very "
+                        "large domains where the live GUI lags. Report path defaults "
+                        "to adcontrol_<DOMAIN>_<timestamp>.html; override with --report.")
+    p.add_argument("--full", action="store_true",
+                   help="Deprecated/no-op: the offline report now lazy-renders "
+                        "per-principal detail client-side, so every edge-bearing "
+                        "principal is always included regardless of domain size.")
     p.add_argument("--subject", help="(CLI) principal to analyze")
     p.add_argument("--report", help="(CLI) write report to this path (.html or .md)")
     p.add_argument("--host", default="127.0.0.1", help="GUI bind host")
@@ -178,11 +242,17 @@ def main():
             print(f"[dc] no --dc given and could not discover a DC for {args.domain}; "
                   f"pass --dc <host/IP>")
 
+    if args.offline and not args.bloodhound:
+        p.error("--offline requires --bloodhound <file> (it is a strictly offline "
+                "parse of BloodHound data)")
+
     # Offline BloodHound import short-circuits the live scan entirely.
     if args.bloodhound:
         from adcontrol import bloodhound as bh_mod
         store = bh_mod.import_zip(args.bloodhound, log=_log)
-        if args.nogui:
+        if args.offline:
+            _offline_domain_report(store, args)
+        elif args.nogui:
             _analyze_store(store, args)
         else:
             from adcontrol.app import run
