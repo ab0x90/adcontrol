@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Runtime data — collected AD sessions are pickles (do not commit; can be large
+# and contain domain data). Recreated at runtime.
+adcontrol_sessions/
+*.pkl
+
+# Exported reports — includes adcontrol_<DOMAIN>_<timestamp>.html written by
+# --offline (the actual naming convention `--report` writes, not just files
+# literally suffixed ".report.html")
+*.report.html
+adcontrol_*.html
+reports/
+
+# BloodHound/SharpHound zip collections imported via --bloodhound — real
+# domain data, never meant to be committed
+*.zip
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store

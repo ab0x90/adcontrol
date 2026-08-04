@@ -92,6 +92,32 @@ def _prop(obj, key, default=""):
     return (obj.get("Properties") or {}).get(key, default)
 
 
+# Class-name markers for (group) managed service accounts. NOTE: the gMSA
+# samAccountType is SAM_MACHINE_ACCOUNT (805306369), identical to a plain
+# computer, so it is NOT a usable discriminator; sMSAs use 805306368 which
+# computers never use, so that one alone is safe.
+_MSA_CLASS_MARKERS = ("msds-groupmanagedserviceaccount", "msds-managedserviceaccount")
+_SMSA_SAT = "805306368"
+
+
+def _is_gmsa(bh, classes) -> bool:
+    """True if this BloodHound object is a (group) managed service account.
+
+    Checks, in order of reliability: an explicit gmsa/msa property flag, the
+    msDS-GroupMSAMembership property (who may retrieve the password), the class
+    list, and the sMSA samAccountType. Deliberately does NOT use the gMSA
+    samAccountType (805306369) — it is indistinguishable from a plain computer."""
+    props = bh.get("Properties") or {}
+    if props.get("gmsa") or props.get("msa"):
+        return True
+    if props.get("msds-groupmsamembership") or props.get("msdsgroupmsamembership"):
+        return True
+    cl = classes if isinstance(classes, str) else " ".join(str(c) for c in (classes or []))
+    if any(m in cl.lower() for m in _MSA_CLASS_MARKERS):
+        return True
+    return str(props.get("samaccounttype") or "") == _SMSA_SAT
+
+
 def _load_json_files(source: str) -> dict[str, list]:
     """Return {category: [objects]} from a zip path or a directory of json files.
 
@@ -125,10 +151,25 @@ def _load_json_files(source: str) -> dict[str, list]:
 
 def _cat_from_name(name: str) -> str:
     low = name.lower()
-    for cat in ("users", "groups", "computers", "domains", "gpos", "ous", "containers"):
+    for cat in ("users", "groups", "computers", "domains", "gpos", "ous",
+                "certtemplates", "enterprisecas", "rootcas", "aiacas",
+                "ntauthstores", "issuancepolicies", "containers"):
         if cat in low:
             return cat
     return "containers"
+
+
+# BloodHound ADCS category -> our object_class. Certificate templates are the
+# ESC-analysis targets; the CA/store categories are collected as generic ADCS
+# objects (class kept distinct so they don't pollute the principal lists).
+_ADCS_CAT_CLASS = {
+    "certtemplates": "pKICertificateTemplate",
+    "enterprisecas": "pKIEnrollmentService",
+    "rootcas": "certificationAuthority",
+    "aiacas": "certificationAuthority",
+    "ntauthstores": "certificationAuthority",
+    "issuancepolicies": "container",
+}
 
 
 def _translate_aces(bh_obj, log) -> tuple[str, list[Ace]]:
@@ -152,16 +193,61 @@ def _translate_aces(bh_obj, log) -> tuple[str, list[Ace]]:
     return owner, aces
 
 
+def _materialize_orphan_host_trustees(store, log) -> int:
+    """Create synthetic principal nodes for local-admin/RDP trustees that were
+    never collected as their own object (missing SID) or landed as a
+    non-principal container. Returns the count materialized.
+
+    Only well-formed domain/forest SIDs are materialized — well-known SIDs
+    (S-1-5-32-*, S-1-5-11, …) are left alone (they resolve by name and aren't
+    selectable subjects anyway). The synthetic node is user-class so it flows
+    through every principal-only view (local-admin table, pathfinding)."""
+    made = 0
+    for pr in store.policy_rights:
+        if pr.plane != "host":
+            continue
+        for lbl, sid in zip(pr.trustees, getattr(pr, "trustee_sids", []) or []):
+            if not sid or not sid.startswith("S-1-5-21-"):
+                continue   # only real domain principals; skip built-ins/well-knowns
+            existing = store.by_sid(sid)
+            if existing is not None and existing.object_class in (
+                    "user", "group", "computer"):
+                continue   # already a usable principal
+            if existing is not None:
+                # Present but as a non-principal (e.g. container-classified gMSA):
+                # promote it in place rather than duplicating.
+                existing.object_class = "user"
+                existing.classes = list(dict.fromkeys(existing.classes + ["user"]))
+                existing.extra.setdefault("materialized_host_trustee", True)
+                made += 1
+                continue
+            dn = f"CN={lbl},<materialized-host-trustee>"
+            obj = RawObject(
+                dn=dn, sid=sid, sam=(lbl if lbl and not lbl.startswith("S-1-") else ""),
+                name=lbl, object_class="user", classes=["user"],
+            )
+            obj.extra["materialized_host_trustee"] = True
+            store.add(obj)
+            made += 1
+    return made
+
+
 def _host_rights_from_computer(bh_obj, store, log) -> int:
     """Turn a computer's BloodHound LocalGroups / UserRights into host-plane
     PolicyRight findings. Returns count added."""
     added = 0
     host = _prop(bh_obj, "name") or bh_obj.get("ObjectIdentifier", "")
+    host_sid = _denamespace_sid(bh_obj.get("ObjectIdentifier", ""))
 
-    def resolve(sid):
-        sid = _denamespace_sid(sid)
-        o = store.by_sid(sid)
-        return o.label if o else (R.wellknown_name(sid) or sid)
+    def resolve_pairs(results):
+        """[(label, sid)] for each member, SIDs denamespaced."""
+        pairs = []
+        for m in results or []:
+            sid = _denamespace_sid(m.get("ObjectIdentifier", ""))
+            o = store.by_sid(sid)
+            label = o.label if o else (R.wellknown_name(sid) or sid)
+            pairs.append((label, sid))
+        return pairs
 
     for lg in bh_obj.get("LocalGroups") or []:
         # Determine which local group by the RID at the end of ObjectIdentifier.
@@ -171,11 +257,12 @@ def _host_rights_from_computer(bh_obj, store, log) -> int:
         if not label_sev:
             continue
         label, sev = label_sev
-        members = [resolve(m.get("ObjectIdentifier", "")) for m in (lg.get("Results") or [])]
-        if members:
+        pairs = resolve_pairs(lg.get("Results"))
+        if pairs:
             store.policy_rights.append(PolicyRight(
-                plane="host", right=label, trustees=members,
-                applies_to=host, source=host, severity=sev,
+                plane="host", right=label,
+                trustees=[p[0] for p in pairs], trustee_sids=[p[1] for p in pairs],
+                applies_to=host, applies_to_sid=host_sid, source=host, severity=sev,
                 detail="BloodHound LocalGroups"))
             added += 1
 
@@ -185,11 +272,12 @@ def _host_rights_from_computer(bh_obj, store, log) -> int:
             continue
         friendly = ("Allow log on through RDP" if priv == "SeRemoteInteractiveLogonRight"
                     else "Allow log on locally")
-        members = [resolve(m.get("ObjectIdentifier", "")) for m in (ur.get("Results") or [])]
-        if members:
+        pairs = resolve_pairs(ur.get("Results"))
+        if pairs:
             store.policy_rights.append(PolicyRight(
-                plane="host", right=f"{priv} ({friendly})", trustees=members,
-                applies_to=host, source=host,
+                plane="host", right=f"{priv} ({friendly})",
+                trustees=[p[0] for p in pairs], trustee_sids=[p[1] for p in pairs],
+                applies_to=host, applies_to_sid=host_sid, source=host,
                 severity="high" if "Remote" in priv else "medium",
                 detail="BloodHound UserRights"))
             added += 1
@@ -228,7 +316,16 @@ def import_zip(source: str, log=None) -> ObjectStore:
                 "users": "user", "groups": "group", "computers": "computer",
                 "domains": "domain", "gpos": "groupPolicyContainer",
                 "ous": "organizationalUnit", "containers": "container",
-            }.get(cat, "container")
+            }.get(cat) or _ADCS_CAT_CLASS.get(cat, "container")
+            # gMSA / (s)MSA detection — these are principals that can be local
+            # admin, hold SPNs, be granted rights, etc., but BloodHound may deliver
+            # them in a non-users blob (own category, or Base/container-typed),
+            # which would otherwise misclassify them as a container and hide them
+            # from principal-only views. Detect regardless of category and treat
+            # as a user-like principal.
+            is_gmsa = _is_gmsa(bh, classes)
+            if is_gmsa:
+                oclass = "user"
 
             owner, aces = _translate_aces(bh, log)
             obj = RawObject(
@@ -240,8 +337,18 @@ def import_zip(source: str, log=None) -> ObjectStore:
                 classes=[oclass],
                 owner_sid=owner, aces=aces,
             )
+            if is_gmsa:
+                obj.extra["gmsa"] = True
+            if oclass == "pKICertificateTemplate":
+                from adcontrol import adcs as adcs_mod
+                obj.extra["adcs_template"] = adcs_mod.normalize_from_bh(
+                    bh.get("Properties") or {})
             obj.enabled = bool(_prop(bh, "enabled", True))
-            obj.admin_count = 1 if _prop(bh, "adminsdholderprotected", False) else 0
+            # BloodHound exports the AdminSDHolder/protected flag as "admincount"
+            # (older/other collectors may use "adminsdholderprotected"). Accept
+            # either so adminCount-based queries actually have data.
+            obj.admin_count = 1 if (_prop(bh, "admincount", False)
+                                    or _prop(bh, "adminsdholderprotected", False)) else 0
             spn = bh.get("SPNTargets") or []
             if _prop(bh, "serviceprincipalnames"):
                 obj.extra["spn"] = _prop(bh, "serviceprincipalnames")
@@ -284,8 +391,58 @@ def import_zip(source: str, log=None) -> ObjectStore:
     for bh in computers_raw:
         host_added += _host_rights_from_computer(bh, store, log)
 
+    # Materialize principals that appear ONLY as a host-plane trustee (member of
+    # local Administrators / RDP) but were never collected as their own node —
+    # e.g. a gMSA in a Managed Service Accounts container that wasn't in scope,
+    # or one that classified as a non-principal container. Without this the
+    # finding's trustee is a dead raw SID you cannot select/analyze. We create a
+    # lightweight user-class node so it becomes a first-class, clickable subject.
+    materialized = _materialize_orphan_host_trustees(store, log)
+    if materialized:
+        log(f"[bh] materialized {materialized} orphan host-plane principal(s)", "info")
+
+    # Fourth pass: user↔host logon sessions (BloodHound HasSession).
+    sess_added = _sessions_from_computers(computers_raw, store)
+
+    store.build_session_indexes()
     if not store.domain and store.domain_sid:
         store.domain = ""
     log(f"[bh] imported {len(store)} objects, domain SID {store.domain_sid or '?'}, "
-        f"{host_added} host-plane findings", "info")
+        f"{host_added} host-plane findings, {sess_added} sessions", "info")
     return store
+
+
+# BloodHound computer session blocks, in descending collection confidence. The
+# first two put the user's credentials on the host (reliable); plain Sessions is
+# net-session enumeration (looser, can be stale).
+_SESSION_BLOCKS = (
+    ("PrivilegedSessions", "privileged"),
+    ("RegistrySessions", "registry"),
+    ("Sessions", "netsession"),
+)
+
+
+def _sessions_from_computers(computers_raw, store) -> int:
+    """Parse each computer's session blocks into ``store.sessions``. A session
+    row is ``{UserSID, ComputerSID}`` (SharpHound) — we denamespace the SIDs and
+    tag each with the block's confidence ``kind``. Deduped on (user, host, kind)."""
+    from adcontrol.model import Session
+    seen = set()
+    added = 0
+    for bh in computers_raw:
+        comp_sid = _denamespace_sid(bh.get("ObjectIdentifier", "") or "")
+        for block, kind in _SESSION_BLOCKS:
+            blk = bh.get(block) or {}
+            for row in (blk.get("Results") or []):
+                usid = _denamespace_sid(row.get("UserSID", "") or "")
+                # ComputerSID in the row wins if present, else the computer's own.
+                csid = _denamespace_sid(row.get("ComputerSID", "") or "") or comp_sid
+                if not usid or not csid:
+                    continue
+                key = (usid, csid, kind)
+                if key in seen:
+                    continue
+                seen.add(key)
+                store.sessions.append(Session(user_sid=usid, computer_sid=csid, kind=kind))
+                added += 1
+    return added

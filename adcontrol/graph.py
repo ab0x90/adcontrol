@@ -31,6 +31,36 @@ class MembershipGraph:
         self.store = store
         self._parents_cache: dict[str, set[str]] = {}   # dn -> set of group SIDs (transitive)
         self._members_cache: dict[str, set[str]] = {}   # group dn -> set of member SIDs (transitive)
+        self._child_index: dict[str, set[str]] | None = None  # group dn -> direct child DNs (reverse of member_of)
+
+    def _children_of(self, group_dn: str) -> set[str]:
+        """
+        Direct child DNs of a group, combining BOTH membership directions:
+        the group's own ``members`` and the reverse edge (objects whose
+        ``member_of`` lists this group). BloodHound often records built-in
+        group nesting (e.g. Domain Admins → Administrators) only on the child's
+        member_of side, leaving the parent's members[] empty — so walking
+        members alone under-counts. Built once, cached.
+        """
+        # The reverse index is keyed by the parent's SID when it has one, else by
+        # canonical DN. Keying by SID is essential because BloodHound can store
+        # the same built-in group as two objects — one under a namespaced-SID key
+        # and one under its real LDAP DN — that share a SID but not a DN; a child's
+        # member_of points at one, while the ACE-holding hit may be the other.
+        if self._child_index is None:
+            idx: dict[str, set[str]] = {}
+            for obj in self.store.objects.values():
+                for gdn in obj.member_of:
+                    parent = self.store.by_dn(gdn)
+                    key = (parent.sid or parent.dn) if parent else gdn
+                    idx.setdefault(key, set()).add(obj.dn)
+            self._child_index = idx
+        g = self.store.by_dn(group_dn)
+        kids = set(g.members) if g else set()
+        if g and g.sid:
+            kids |= self._child_index.get(g.sid, set())
+        kids |= self._child_index.get(g.dn if g else group_dn, set())
+        return kids
 
     # -- upward: which groups is this principal in (transitively) --------------
     def group_sids_for(self, obj: RawObject) -> set[str]:
@@ -112,12 +142,16 @@ class MembershipGraph:
 
     # -- downward: who is in this group (transitively) ------------------------
     def member_sids_of(self, group: RawObject) -> set[str]:
-        """All principal SIDs that are members of *group*, transitively."""
+        """All principal SIDs that are members of *group*, transitively.
+
+        Uses both membership directions (see :meth:`_children_of`) so nested
+        built-in groups whose edge is only recorded on the child side are still
+        counted."""
         if group.dn in self._members_cache:
             return self._members_cache[group.dn]
         seen_dn: set[str] = set()
         sids: set[str] = set()
-        stack = list(group.members)
+        stack = list(self._children_of(group.dn))
         while stack:
             mdn = stack.pop()
             if mdn in seen_dn:
@@ -129,7 +163,7 @@ class MembershipGraph:
             if m.sid:
                 sids.add(m.sid)
             if m.object_class == "group":
-                stack.extend(m.members)
+                stack.extend(self._children_of(m.dn))
         self._members_cache[group.dn] = sids
         return sids
 

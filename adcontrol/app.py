@@ -58,6 +58,25 @@ def _emit_log(msg, level="info"):
     socketio.emit("log", {"msg": msg, "level": level})
 
 
+def _set_analyzer(store, warm=True):
+    """Install a fresh Analyzer for `store` and (by default) warm its reverse
+    ACL index up front, so the first query is instant instead of paying the
+    one-time index build. Safe to call from any load path."""
+    az = Analyzer(store)
+    if warm:
+        try:
+            _ = az.acl_index  # build the trustee->edges index once
+        except Exception:
+            pass
+    try:
+        from adcontrol import adcs as adcs_mod
+        adcs_mod.analyze_adcs(store, az, log=_emit_log)
+    except Exception as e:
+        _emit_log(f"[adcs] analysis skipped: {e}", "warn")
+    STATE["analyzer"] = az
+    return az
+
+
 def _run_collection(params):
     STATE["collecting"] = True
     STATE["logs"] = []
@@ -77,8 +96,9 @@ def _run_collection(params):
         do_gpo = params.get("gpo", True)
         host_mode = params.get("host_mode", "none")   # "none" | "all" | "list"
         hosts_spec = params.get("hosts", "")
+        session_mode = params.get("session_mode", "none")   # "none" | "all" | "list"
         smb_creds = None
-        if do_gpo or host_mode != "none":
+        if do_gpo or host_mode != "none" or session_mode != "none":
             smb_creds = SmbCreds(
                 username=params["username"], password=params.get("password", ""),
                 domain=client.domain, nthash=params.get("nthash", ""),
@@ -98,8 +118,15 @@ def _run_collection(params):
         elif smb_creds and host_mode == "all":
             targets = hr_mod.hosts_from_store(store)
             hr_mod.collect_host_rights(store, smb_creds, targets, log=_emit_log)
+        # Tier 3 live session plane, resolved after LDAP.
+        if smb_creds and session_mode != "none":
+            from adcontrol import sessions as sess_mod
+            stargets = (hr_mod.hosts_from_spec(hosts_spec)
+                        if session_mode == "list" and hosts_spec
+                        else hr_mod.hosts_from_store(store))
+            sess_mod.collect_sessions(store, smb_creds, stargets, log=_emit_log)
         STATE["store"] = store
-        STATE["analyzer"] = Analyzer(store)
+        _set_analyzer(store)
         # Persist.
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         path = os.path.join(SESS_DIR, f"{store.domain or 'domain'}_{ts}.pkl")
@@ -198,7 +225,7 @@ def import_bloodhound():
         STATE["logs"] = []
         store = bh_mod.import_zip(src, log=_emit_log)
         STATE["store"] = store
-        STATE["analyzer"] = Analyzer(store)
+        _set_analyzer(store)
         # Persist as a session so it can be reloaded.
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         try:
@@ -237,11 +264,32 @@ def load_session():
         with open(path, "rb") as fh:
             store = pickle.load(fh)
         STATE["store"] = store
-        STATE["analyzer"] = Analyzer(store)
+        _set_analyzer(store)
         return jsonify({"ok": True, "count": len(store), "principals": len(store.principals()),
                         "domain": store.domain})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+# Map AD object_class values → the friendly filter/badge types the GUI uses.
+_TYPE_MAP = {
+    "user": "user",
+    "group": "group",
+    "computer": "computer",
+    "groupPolicyContainer": "gpo",
+    "organizationalUnit": "ou",
+    "domain": "domain",
+    "container": "container",
+}
+# Default set when no ?types= is given — preserves the original behaviour of
+# only listing selectable principals (user/group/computer).
+_DEFAULT_TYPES = ("user", "group", "computer")
+# Every type the filter UI can request.
+_ALL_TYPES = ("user", "group", "computer", "gpo", "ou", "domain", "container")
+
+
+def _friendly_type(object_class: str) -> str:
+    return _TYPE_MAP.get(object_class, "other")
 
 
 @app.route("/api/principals")
@@ -250,14 +298,59 @@ def principals():
     if not store:
         return jsonify({"error": "nothing collected"}), 400
     q = request.args.get("q", "").strip()
-    src = store.find(q) if q else store.principals()
-    src = [o for o in src if o.object_class in ("user", "group", "computer")]
-    src.sort(key=lambda o: (o.object_class, o.label.lower()))
-    return jsonify({"principals": [
-        {"key": o.sid or o.dn, "label": o.label, "class": o.object_class,
-         "dn": o.dn, "enabled": o.enabled, "admin_count": o.admin_count}
-        for o in src[:500]
-    ]})
+
+    # ?types=user,group,gpo … filters by friendly type. Absent → default set.
+    types_arg = request.args.get("types", "").strip()
+    if types_arg:
+        wanted = {t.strip().lower() for t in types_arg.split(",") if t.strip()}
+        wanted &= set(_ALL_TYPES)
+    else:
+        wanted = set(_DEFAULT_TYPES)
+
+    src = store.find(q) if q else list(store.objects.values())
+    src = [o for o in src if _friendly_type(o.object_class) in wanted]
+    src.sort(key=lambda o: (_friendly_type(o.object_class), o.label.lower()))
+    return jsonify({
+        "principals": [
+            {"key": o.sid or o.dn, "label": o.label,
+             "class": _friendly_type(o.object_class), "object_class": o.object_class,
+             "dn": o.dn, "enabled": o.enabled, "admin_count": o.admin_count}
+            for o in src[:500]
+        ],
+        # Per-type counts across the whole store, so the UI can show badges even
+        # for types not currently selected.
+        "counts": _type_counts(store),
+    })
+
+
+def _type_counts(store) -> dict:
+    counts = {t: 0 for t in _ALL_TYPES}
+    for o in store.objects.values():
+        ft = _friendly_type(o.object_class)
+        if ft in counts:
+            counts[ft] += 1
+    return counts
+
+
+@app.route("/api/queries")
+def queries_list():
+    """The canned queries available in the Queries panel."""
+    from adcontrol import queries as q_mod
+    return jsonify({"queries": q_mod.list_queries()})
+
+
+@app.route("/api/query/<query_id>")
+def queries_run(query_id):
+    """Run a canned query across the whole store; returns principal-list rows."""
+    from adcontrol import queries as q_mod
+    store, az = STATE["store"], STATE["analyzer"]
+    if not store or not az:
+        return jsonify({"error": "nothing collected"}), 400
+    try:
+        hits = q_mod.run_query(query_id, store, az)
+    except KeyError:
+        return jsonify({"error": f"unknown query: {query_id}"}), 404
+    return jsonify({"query": query_id, "count": len(hits), "results": hits})
 
 
 def _resolve(store, key):
@@ -281,16 +374,124 @@ def analyze(key):
     if not subj:
         return jsonify({"error": "principal not found"}), 404
     s = az.summarize(subj)
+    # Add the friendly type so the detail header badge matches the list badges.
+    subject = dict(s["subject"])
+    subject["object_class"] = subject.get("class", "")
+    subject["class"] = _friendly_type(subject.get("class", ""))
     return jsonify({
-        "subject": s["subject"],
+        "subject": subject,
         "outbound": [_edge_json(e) for e in s["outbound"]],
         "inbound": [_edge_json(e) for e in s["inbound"]],
         "policy_rights": [{
             "plane": pr.plane, "right": pr.right, "trustees": pr.trustees,
             "applies_to": pr.applies_to, "source": pr.source, "severity": pr.severity,
         } for pr in s["policy_rights"]],
+        "sessions": _sessions_json(store, subj),
+        "local_admin_rdp": s["local_admin_rdp"],
+        "adcs": s["adcs"],
         "outbound_high": s["outbound_high"], "inbound_high": s["inbound_high"],
         "effective_group_count": s["effective_group_count"],
+    })
+
+
+def _sessions_json(store, subj):
+    """Logon sessions relevant to the subject: for a computer, who is logged on;
+    for a user, where they are logged on. Each row resolves the *other* end to a
+    selectable key so the GUI can click through to it."""
+    rows = []
+    if subj.object_class == "computer" and subj.sid:
+        for sess in store.sessions_on_host(subj.sid):
+            u = store.by_sid(sess.user_sid)
+            rows.append({"key": (u.sid or u.dn) if u else sess.user_sid,
+                         "label": u.label if u else sess.user_sid,
+                         "object_class": u.object_class if u else "",
+                         "kind": sess.kind, "role": "user on this host"})
+    elif subj.object_class == "user" and subj.sid:
+        for sess in store.sessions_of_user(subj.sid):
+            c = store.by_sid(sess.computer_sid)
+            rows.append({"key": (c.sid or c.dn) if c else sess.computer_sid,
+                         "label": c.label if c else sess.computer_sid,
+                         "object_class": c.object_class if c else "",
+                         "kind": sess.kind, "role": "host this user is on"})
+    # Reliable sessions first, then by label.
+    order = {"privileged": 0, "registry": 1, "netsession": 2}
+    rows.sort(key=lambda r: (order.get(r["kind"], 9), r["label"].lower()))
+    return rows
+
+
+@app.route("/api/members/<path:key>")
+def members(key):
+    """Transitive members of a group, for the 'View members' modal. Each member
+    row is a selectable principal (its ``key`` loads that member's own analysis).
+    ``direct`` marks members that are direct (not only nested) members."""
+    store, az = STATE["store"], STATE["analyzer"]
+    if not store or not az:
+        return jsonify({"error": "nothing collected"}), 400
+    grp = _resolve(store, key)
+    if not grp:
+        return jsonify({"error": "principal not found"}), 404
+    if grp.object_class != "group":
+        return jsonify({"error": "not a group"}), 400
+
+    # Direct-child DNs (both membership directions) → mark direct vs nested-only.
+    direct_dns = az.graph._children_of(grp.dn)
+    direct_sids = set()
+    for dn in direct_dns:
+        m = store.by_dn(dn)
+        if m and m.sid:
+            direct_sids.add(m.sid)
+
+    sids = az.graph.member_sids_of(grp)
+    rows = []
+    for sid in sids:
+        m = store.by_sid(sid)
+        if m is None:
+            rows.append({"key": sid, "label": az.graph.label_for_sid(sid),
+                         "class": "other", "object_class": "", "enabled": True,
+                         "admin_count": 0, "direct": sid in direct_sids})
+        else:
+            rows.append({"key": m.sid or m.dn, "label": m.label,
+                         "class": _friendly_type(m.object_class),
+                         "object_class": m.object_class, "enabled": m.enabled,
+                         "admin_count": m.admin_count, "direct": sid in direct_sids})
+    # Groups first (so nested groups are easy to drill into), then class, then name.
+    rows.sort(key=lambda x: (x["class"] != "group", x["class"], x["label"].lower()))
+    return jsonify({
+        "group": {"label": grp.label, "key": grp.sid or grp.dn, "dn": grp.dn},
+        "member_count": len(rows),
+        "direct_count": sum(1 for r in rows if r["direct"]),
+        "members": rows,
+    })
+
+
+@app.route("/api/paths/<path:key>")
+def paths(key):
+    """Multi-hop attack paths from the subject to the Tier-0 goal set (or an
+    explicit ?target=<dn>). ?mode=short (default, BFS shortest) | full (all
+    simple paths, count-capped) | full-uncapped (no count cap, wall-clock
+    backstop only — can be slow/large on a dense graph). The response carries a
+    ``truncated`` flag when enumeration stopped early."""
+    store, az = STATE["store"], STATE["analyzer"]
+    if not store or not az:
+        return jsonify({"error": "nothing collected"}), 400
+    subj = _resolve(store, key)
+    if not subj:
+        return jsonify({"error": "principal not found"}), 404
+    from adcontrol.paths import PathFinder
+    mode = request.args.get("mode", "short")
+    target = request.args.get("target") or None
+    pf = PathFinder(az)
+    already = pf.already_tier0(subj) if not target else False
+    result = pf.find_result(subj, mode=mode, target_dn=target)
+    return jsonify({
+        "subject": {"label": subj.label, "sid": subj.sid, "dn": subj.dn},
+        "mode": mode,
+        "already_tier0": already,
+        "count": len(result.paths),
+        "truncated": result.truncated,
+        "truncated_reason": result.reason,
+        "truncated_limit": result.limit,
+        "paths": [p.as_json() for p in result.paths],
     })
 
 
@@ -395,5 +596,5 @@ def run(host="127.0.0.1", port=5006, prefill=None, preloaded_store=None):
         PREFILL.update(prefill)
     if preloaded_store is not None:
         STATE["store"] = preloaded_store
-        STATE["analyzer"] = Analyzer(preloaded_store)
+        _set_analyzer(preloaded_store)
     socketio.run(app, host=host, port=port, allow_unsafe_werkzeug=True)
