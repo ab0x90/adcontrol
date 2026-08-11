@@ -142,6 +142,7 @@ class ObjectStore:
         self.domain_sid: str = ""
         self.base_dn: str = ""
         self.schema_guid_names: dict[str, str] = {}  # objtype GUID -> attribute/class friendly name
+        self.oid_group_links: dict[str, str] = {}    # issuance-policy OID value -> linked group DN (ESC13)
         self.collected_at: str = ""
         self.source: str = "live-ldap"               # or "offline:<kind>"
         self.meta: dict = field(default_factory=dict) if False else {}
@@ -157,6 +158,7 @@ class ObjectStore:
         self.__dict__.setdefault("adcs_findings", [])
         self.__dict__.setdefault("_sessions_on_host", {})
         self.__dict__.setdefault("_user_sessions", {})
+        self.__dict__.setdefault("oid_group_links", {})
 
     # -- population -----------------------------------------------------------
     def add(self, obj: RawObject) -> None:

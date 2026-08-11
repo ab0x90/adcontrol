@@ -205,15 +205,22 @@ class PathFinder:
 
         "Contains" is resolved by DN nesting (the principal's DN sits under the
         OU's DN) — always available, unlike BloodHound's GPOChanges/AffectedComputers
-        which are frequently empty in exports. Resolved from ``gplinks`` (GPO GUIDs
-        on the OU/domain) matched to GPO objects by GUID; degrades to {} when link
-        data is absent, so no false Tier-0 GPOs are invented."""
-        gpo_by_guid = {}
+        which are frequently empty in exports. Resolved from ``gplinks`` on the
+        OU/domain, matched to GPO objects by EITHER identifier — the two
+        collectors populate ``gplinks`` differently: the live collector's
+        ``_parse_gplink`` (collector.py) stores the linked GPO's full **DN**
+        (straight from LDAP's gPLink), while the BloodHound importer stores the
+        GPO's **GUID** (``Links[].GUID``/``ObjectIdentifier``). Matching only one
+        of the two silently drops every Tier-0-linked GPO on whichever source
+        wasn't matched — caught when a live GOAD scan showed zero GPO targets
+        despite a GPO linked straight to the domain root. Degrades to {} when
+        link data is absent, so no false Tier-0 GPOs are invented."""
+        gpo_by_key = {}
         for o in self.store.objects.values():
             if o.object_class in ("groupPolicyContainer", "gpo"):
-                for key in (o.guid, o.sid):
+                for key in (o.guid, o.sid, o.dn):
                     if key:
-                        gpo_by_guid[key.upper()] = o
+                        gpo_by_key[key.upper()] = o
 
         # Tier-0 principals whose DN we can locate under an OU.
         tier0_dns = []
@@ -244,8 +251,8 @@ class PathFinder:
                 reach = f"OU {cont.label} — affects Tier-0: {sample}"
             else:
                 continue
-            for guid in cont.gplinks:
-                g = gpo_by_guid.get(guid.upper())
+            for link in cont.gplinks:
+                g = gpo_by_key.get(link.upper())
                 if g is not None:
                     out[g.dn] = f"{g.label} (GPO linked to {reach})"
         return out

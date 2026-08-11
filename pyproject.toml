@@ -13,14 +13,21 @@ dependencies = [
     "impacket>=0.12.0",
     "ldap3==2.9.1",
     "flask>=3.0",
-    "flask-socketio>=5.3",
+    "rich>=13.0.0",
 ]
 
+[project.optional-dependencies]
+# Reuses certipy's own MS-CRTD flag-bit tables + EKU OID names for the
+# certificate-template detail view. ESC detection works without it; only the
+# decoded-flag-names display degrades to raw hex if absent.
+adcs = ["certipy-ad>=5.0"]
+
 [project.scripts]
-adcontrol = "adcontrol.cli:main"
+adcontrol-scan = "adcontrol_scan:main"
+adcontrol-web = "adcontrol_web:main"
 
 [tool.setuptools]
-py-modules = []
+py-modules = ["adcontrol_scan", "adcontrol_web"]
 
 [tool.setuptools.packages.find]
 include = ["adcontrol*"]

@@ -4,7 +4,6 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>adcontrol — AD Object Control Analyzer</title>
-<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
 <style>
 :root{color-scheme:light dark;--hi:#e5484d;--med:#e0a800;--lo:#3a9e6a;--bg:#0f1012;--panel:#1a1b1e;--line:#2c2e33;--fg:#e7e7ea;--dim:#8b8d93;--accent:#5b8def}
 *{box-sizing:border-box}
@@ -33,6 +32,8 @@ button:disabled{opacity:.5;cursor:not-allowed}
 .pill{font-size:.62rem;text-transform:uppercase;padding:.05em .4em;border-radius:99px;background:#ffffff18;color:var(--dim)}
 .pill.user{background:#3a9e6a33;color:#7fdcaa}.pill.group{background:#5b8def33;color:#9bbcf5}.pill.computer{background:#e0a80033;color:#f0cf6a}
 .pill.gpo{background:#b06de033;color:#d3a6f0}.pill.ou{background:#4bb6c933;color:#8fd6e2}.pill.domain{background:#e07a5f33;color:#f0b3a0}.pill.container{background:#8a8f9a33;color:#c2c6cf}
+.pill.template{background:#e5484d33;color:#f5989c}
+.pill.ca{background:#c9622733;color:#e8a668}
 .tfilter{display:flex;flex-wrap:wrap;gap:.3rem;margin-bottom:.5rem}
 .tchip{font-size:.66rem;text-transform:uppercase;padding:.2em .55em;border-radius:99px;border:1px solid var(--line);background:transparent;color:var(--dim);cursor:pointer;font-weight:600;user-select:none;width:auto}
 .tchip.on{background:var(--accent);border-color:var(--accent);color:#fff}
@@ -121,7 +122,7 @@ tbody tr:hover{background:#ffffff0d}
       <h2>Principals</h2>
       <input class="search" id="search" placeholder="search name / DN / SID…" oninput="debouncedSearch()">
       <div class="tfilter" id="tfilter"></div>
-      <div class="plist" id="plist"><div class="none" style="padding:.6rem">Collect or load a session first.</div></div>
+      <div class="plist" id="plist"><div class="none" style="padding:.6rem">Load a scan run to begin.</div></div>
     </div>
 
     <div class="panel" id="queriesPanel" style="margin-top:1rem">
@@ -136,50 +137,20 @@ tbody tr:hover{background:#ffffff0d}
       </div>
     </div>
 
-    <div class="panel" id="collectPanel" style="margin-top:1rem">
-      <h2 style="cursor:pointer;user-select:none" onclick="toggleCollect()"><span id="collectCaret">▾</span> Collect</h2>
-      <div id="collectBody">
-      <label>Domain Controller (host / IP)</label>
-      <input id="dc" placeholder="dc01.corp.local">
-      <div class="row">
-        <div><label>Username</label><input id="username" placeholder="user"></div>
-        <div><label>Domain</label><input id="domain" placeholder="corp.local"></div>
+    <div class="panel" id="runPanel" style="margin-top:1rem">
+      <h2 style="cursor:pointer;user-select:none" onclick="toggleRunPanel()"><span id="runCaret">▾</span> Load run</h2>
+      <div id="runBody">
+      <label>Scan run (from adcontrol_scan.py's loot/ folder)</label>
+      <div style="display:flex;gap:.5rem">
+        <select id="runSel" style="flex:1"><option value="">— pick a run —</option></select>
+        <button id="loadRunBtn" onclick="loadRun()">Load</button>
       </div>
-      <label>Password</label><input id="password" type="password" placeholder="(or use hash / kerberos)">
-      <label>NT hash (PtH)</label><input id="nthash" placeholder="LM:NT or :NT">
-      <div class="chk"><input type="checkbox" id="kerberos"><label style="margin:0;text-transform:none;letter-spacing:0;color:var(--fg)">Kerberos</label></div>
-      <div class="chk"><input type="checkbox" id="ldaps"><label style="margin:0;text-transform:none;letter-spacing:0;color:var(--fg)">Force LDAPS</label></div>
-      <div class="row"><div><label>AES key (opt)</label><input id="aes_key"></div>
-        <div><label>DC IP (opt)</label><input id="dc_ip"></div></div>
-      <label style="margin-top:.7rem">Collection tier</label>
-      <div class="chk"><input type="checkbox" id="gpo" checked>
-        <label style="margin:0;text-transform:none;letter-spacing:0;color:var(--fg)">GPO rights (DC SYSVOL only — no host fan-out)</label></div>
-      <label style="margin-top:.4rem">Per-host RDP / admin (touches hosts)</label>
-      <select id="host_mode" onchange="document.getElementById('hostsRow').style.display=this.value==='list'?'block':'none'">
-        <option value="none">none (DC-only, default)</option>
-        <option value="all">all collected computers (noisy)</option>
-        <option value="list">specific hosts…</option>
-      </select>
-      <div id="hostsRow" style="display:none"><label>Hosts (comma-separated or file path)</label><input id="hosts" placeholder="ws01.corp.local,srv02.corp.local"></div>
-      <label style="margin-top:.4rem" title="Enumerate who is logged on to each host (NetWkstaUserEnum + NetSessionEnum) — enables HasSession attack paths on a live pull. Fans out to hosts. 'list' reuses the host list above.">Logon sessions (touches hosts)</label>
-      <select id="session_mode">
-        <option value="none">none (default)</option>
-        <option value="all">all collected computers (noisy)</option>
-        <option value="list">use the host list above</option>
-      </select>
-      <div style="margin-top:.8rem;display:flex;gap:.5rem">
-        <button id="collectBtn" onclick="startCollect()">Collect</button>
-        <select id="sessSel" class="ghost" style="flex:1" onchange="loadSession()"><option value="">load session…</option></select>
+      <div class="qdesc" id="runDesc" style="margin-top:.4rem">
+        No run loaded. Runs are produced by <code>adcontrol_scan.py</code> — refresh this list with the button below after a scan finishes.
       </div>
-      <div style="margin-top:.6rem;border-top:1px solid var(--line);padding-top:.6rem">
-        <label style="margin-top:0">Offline — import BloodHound zip</label>
-        <div style="display:flex;gap:.5rem;align-items:center">
-          <input type="file" id="bhFile" accept=".zip,.json" style="flex:1;font-size:.8rem">
-          <button class="ghost" onclick="importBloodhound()">Import</button>
-        </div>
-      </div>
+      <button class="ghost" style="margin-top:.5rem" onclick="loadRuns()">Refresh list</button>
       <div class="log" id="log"></div>
-      </div><!-- /collectBody -->
+      </div><!-- /runBody -->
     </div>
   </div>
   <!-- RIGHT: results -->
@@ -196,58 +167,44 @@ tbody tr:hover{background:#ffffff0d}
   </div>
 </div>
 <script>
-const socket = io();
 let selectedKey = null;
 let currentAnalysis = null;      // last /api/analyze result, for re-render on toggle
 let hideBuiltin = true;          // hide built-in-admin→infra "noise" edges by default
-socket.on('log', m => appendLog(m.msg, m.level));
-socket.on('done', d => {
-  document.getElementById('collectBtn').disabled = false;
-  if(d.ok){ appendLog(`[done] ${d.count} objects, ${d.principals} principals`,'info'); refreshStatus(); loadPrincipals(''); refreshQuery(); }
-  else appendLog('[done] collection failed','error');
-});
 function appendLog(msg,level){const l=document.getElementById('log');const d=document.createElement('div');d.className=level||'info';d.textContent=msg;l.appendChild(d);l.scrollTop=l.scrollHeight;}
-function val(id){return document.getElementById(id).value.trim();}
-function chk(id){return document.getElementById(id).checked;}
-async function startCollect(){
-  document.getElementById('log').innerHTML='';
-  document.getElementById('collectBtn').disabled=true;
-  const body={dc:val('dc'),username:val('username'),domain:val('domain'),password:val('password'),
-    nthash:val('nthash'),kerberos:chk('kerberos'),ldaps:chk('ldaps'),aes_key:val('aes_key'),dc_ip:val('dc_ip'),
-    gpo:chk('gpo'),host_mode:document.getElementById('host_mode').value,hosts:val('hosts'),
-    session_mode:document.getElementById('session_mode').value};
-  const r=await fetch('/api/collect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  if(!r.ok){const e=await r.json();appendLog('[error] '+(e.error||r.status),'error');document.getElementById('collectBtn').disabled=false;}
-}
-async function importBloodhound(){
-  const f=document.getElementById('bhFile').files[0];
-  if(!f){appendLog('[bh] choose a BloodHound zip first','warn');return;}
-  document.getElementById('log').innerHTML='';
-  appendLog('[bh] uploading '+f.name+' ('+Math.round(f.size/1024)+' KB)…','info');
-  const fd=new FormData();fd.append('file',f);
-  try{
-    const r=await fetch('/api/import-bloodhound',{method:'POST',body:fd});
-    const s=await r.json();
-    if(!r.ok){appendLog('[bh] error: '+(s.error||r.status),'error');return;}
-    appendLog(`[bh] imported ${s.count} objects / ${s.principals} principals (${s.domain})`,'info');
-    refreshStatus();loadPrincipals('');refreshQuery();
-    document.getElementById('collectBody').style.display='none';
-    document.getElementById('collectCaret').textContent='▸';
-  }catch(e){appendLog('[bh] upload failed: '+e.message,'error');}
-}
 async function refreshStatus(){const r=await fetch('/api/status');const s=await r.json();
-  document.getElementById('status').textContent=s.collected?`${s.domain} · ${s.count} objects · ${s.principals} principals`:(s.collecting?'collecting…':'not collected');
+  document.getElementById('status').textContent=s.collected?`${s.domain} · ${s.count} objects · ${s.principals} principals (run ${s.run_id})`:'no run loaded';
   return s;}
-async function loadSessions(){const r=await fetch('/api/sessions');const s=await r.json();
-  const sel=document.getElementById('sessSel');s.sessions.forEach(n=>{const o=document.createElement('option');o.value=n;o.textContent=n;sel.appendChild(o);});}
-async function loadSession(){const name=document.getElementById('sessSel').value;if(!name)return;
-  const r=await fetch('/api/load-session',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
-  const s=await r.json();if(s.ok){appendLog(`[session] loaded ${s.count} objects`,'info');refreshStatus();loadPrincipals('');refreshQuery();}else appendLog('[error] '+s.error,'error');}
+async function loadRuns(){
+  const r=await fetch('/api/runs');const s=await r.json();
+  const sel=document.getElementById('runSel');
+  sel.innerHTML='<option value="">— pick a run —</option>';
+  (s.runs||[]).forEach(run=>{
+    const o=document.createElement('option');o.value=run.run_id;
+    o.textContent=`${run.run_id} — ${run.domain||run.target||'?'} (${run.object_count} objs, ${run.mode})`;
+    sel.appendChild(o);
+  });
+}
+async function loadRun(){
+  const runId=document.getElementById('runSel').value;
+  if(!runId){appendLog('[run] pick a run first','warn');return;}
+  document.getElementById('log').innerHTML='';
+  document.getElementById('loadRunBtn').disabled=true;
+  try{
+    const r=await fetch('/api/load-run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({run_id:runId})});
+    const s=await r.json();
+    if(!r.ok){appendLog('[run] error: '+(s.error||r.status),'error');return;}
+    appendLog(`[run] loaded ${s.count} objects / ${s.principals} principals (${s.domain})`,'info');
+    (s.log||[]).forEach(m=>appendLog(m.msg,m.level));
+    document.getElementById('runDesc').textContent=`Loaded run ${s.run_id} — ${s.domain}, ${s.count} objects, ${s.principals} principals.`;
+    refreshStatus();loadPrincipals('');refreshQuery();
+  }catch(e){appendLog('[run] load failed: '+e.message,'error');}
+  finally{document.getElementById('loadRunBtn').disabled=false;}
+}
 let searchTimer;
 // Which principal types are shown. Defaults to the selectable trio; GPO/OU/
 // domain/container are opt-in via the filter chips.
-const ALL_TYPES=['user','group','computer','gpo','ou','domain','container'];
-const TYPE_LABEL={user:'Users',group:'Groups',computer:'Machines',gpo:'GPOs',ou:'OUs',domain:'Domain',container:'Containers'};
+const ALL_TYPES=['user','group','computer','gpo','ou','domain','container','template','ca'];
+const TYPE_LABEL={user:'Users',group:'Groups',computer:'Machines',gpo:'GPOs',ou:'OUs',domain:'Domain',container:'Containers',template:'Cert Templates',ca:'CAs'};
 let activeTypes=new Set(['user','group','computer']);
 let typeCounts={};
 function debouncedSearch(){clearTimeout(searchTimer);searchTimer=setTimeout(()=>loadPrincipals(document.getElementById('search').value),200);}
@@ -303,7 +260,7 @@ function edgeTable(edges,dir){
   let rows=shown.map((e,i)=>{const who=dir==='out'?e.target_label:e.source_label;
     return `<tr class="${e.builtin_noise?'noiserow':''}" onclick="openEdge('${dir}',${i})" title="Click for detail, attack path & advice"><td><span class="sev ${e.severity}">${e.severity}</span></td>
       <td class="rt">${esc(e.right)}</td>
-      <td>${esc(who)}${e.broad?'<span class="broad">BROAD</span>':''}${e.builtin_noise?'<span class="pill" style="margin-left:.3em">built-in</span>':''}</td>
+      <td>${esc(who)}${e.broad?'<span class="broad">BROAD</span>':''}${e.builtin_noise?'<span class="pill" style="margin-left:.3em">built-in</span>':''}${e.target_tier0?`<span class="broad" style="margin-left:.3em;background:var(--crit,#e5484d)" title="${esc(e.target_tier0)}">⚠ TIER-0</span>`:''}</td>
       <td>${esc(e.target_class)}</td><td>${esc(e.via)}</td>
       <td class="scope">${esc(e.applies_to||'whole object')}</td></tr>`;}).join('');
   return note+`<table><thead><tr><th>Sev</th><th>Right</th><th>${whoCol}</th><th>Class</th><th>Via</th><th>Scope</th></tr></thead><tbody>${rows}</tbody></table>`;
@@ -341,6 +298,231 @@ function reachSection(su,reach){
       ${reachTable(la,'No local-admin rights to any collected host.')}</div>
     <div class="dir reach"><h3>🖥 RDP access — systems ${esc(su.label)} can log on to</h3>
       ${reachTable(rdp,'No RDP rights to any collected host.')}</div>`;
+}
+function gpoScopeSection(su,scope){
+  // Where a GPO is linked and what falls under that — independent of whether
+  // the GPO pushes a tracked SecEdit/Restricted-Groups setting (tier-2 below
+  // only fires for those) or whether anyone can currently edit it (the GPO
+  // control query). A GPO linked straight to the DCs shows that here even if
+  // it only sets a wallpaper.
+  if(su.object_class!=='groupPolicyContainer')return '';
+  const linked=(scope&&scope.linked)||[];
+  if(!linked.length)return `<div class="dir gposcope"><h3>🔗 GPO scope — what ${esc(su.label)} affects</h3>
+    <div class="none">Not linked to any OU/domain (gPLink data absent or GPO unlinked).</div></div>`;
+  const rows=linked.map(l=>`<tr>
+    <td class="rt">${esc(l.reach)}</td>
+    <td>${esc(l.label)}</td>
+    <td class="scope">${esc(l.class)}</td></tr>`).join('');
+  const tier0=(scope.affected_tier0||[]);
+  const total=scope.affected_computers+scope.affected_users;
+  return `<div class="dir gposcope"><h3>🔗 GPO scope — what ${esc(su.label)} affects</h3>
+    <table><thead><tr><th>Reach</th><th>Linked to</th><th>Class</th></tr></thead><tbody>${rows}</tbody></table>
+    <div class="mono" style="margin-top:.5rem">${scope.affected_computers} computer(s), ${scope.affected_users} user(s) in scope
+      ${tier0.length?`<span class="broad" title="${esc(tier0.join(', '))}" style="margin-left:.5rem">includes Tier-0: ${esc(tier0.slice(0,3).join(', '))}${tier0.length>3?' +'+(tier0.length-3):''}</span>`:''}
+    </div>
+    ${total?`<button class="ghost" style="margin-top:.6rem" onclick="openGpoScope()">🔗 View relationships (${total})</button>`:''}
+    </div>`;
+}
+// ---- GPO scope modal: relationship table + copy-friendly list view ----
+let gpoScopeMode='table';       // 'table' | 'list'
+let gpoScopeFilter='both';      // 'computers' | 'users' | 'both'
+function openGpoScope(){
+  if(!currentAnalysis||!currentAnalysis.gpo_scope)return;
+  gpoScopeMode='table'; gpoScopeFilter='both';
+  document.getElementById('modal').classList.add('open');
+  renderGpoScope(currentAnalysis.gpo_scope, currentAnalysis.subject.label);
+}
+function gpoScopeRow(p,i){
+  return `<tr class="memrow" onclick="selectScopePrincipal(${i})" title="Analyze ${esc(p.label)}">
+    <td class="rt">${esc(p.label)}${p.tier0?' <span class="broad" style="margin-left:.3em">TIER-0</span>':''}</td>
+    <td class="scope">click to analyze →</td></tr>`;
+}
+function renderGpoScope(scope,gpoLabel){
+  window._scopedata=scope; window._scopelabel=gpoLabel;
+  const all=(scope.computers||[]).map(p=>({...p,cls:'computer'}))
+    .concat((scope.users||[]).map(p=>({...p,cls:'user'})));
+  window._scopeAll=all;   // indexable by row click, for selectScopePrincipal
+  const linkedRows=(scope.linked||[]).map(l=>`<tr>
+    <td class="rt">${esc(l.reach)}</td><td>${esc(l.label)}</td><td class="scope">${esc(l.class)}</td></tr>`).join('');
+
+  const modeToggle=`<div style="display:flex;gap:.7rem;align-items:center;margin:.7rem 0;flex-wrap:wrap">
+    <label class="chk" style="display:inline-flex;cursor:pointer"><input type="radio" name="scopemode" value="table" ${gpoScopeMode==='table'?'checked':''}
+      onchange="gpoScopeMode='table';renderGpoScope(window._scopedata,window._scopelabel)"><span style="text-transform:none;letter-spacing:0;color:var(--fg)">Table</span></label>
+    <label class="chk" style="display:inline-flex;cursor:pointer"><input type="radio" name="scopemode" value="list" ${gpoScopeMode==='list'?'checked':''}
+      onchange="gpoScopeMode='list';renderGpoScope(window._scopedata,window._scopelabel)"><span style="text-transform:none;letter-spacing:0;color:var(--fg)">Copy list</span></label>
+    ${gpoScopeMode==='list'?`
+    <select onchange="gpoScopeFilter=this.value;renderGpoScope(window._scopedata,window._scopelabel)">
+      <option value="both" ${gpoScopeFilter==='both'?'selected':''}>Computers + users</option>
+      <option value="computers" ${gpoScopeFilter==='computers'?'selected':''}>Computers only</option>
+      <option value="users" ${gpoScopeFilter==='users'?'selected':''}>Users only</option>
+    </select>
+    <button class="ghost" onclick="copyScopeList()">📋 Copy</button>`:''}
+  </div>`;
+
+  let content;
+  if(gpoScopeMode==='table'){
+    const idx=(cls)=>all.map((p,i)=>({p,i})).filter(x=>x.p.cls===cls);
+    const compRows=idx('computer').map(x=>gpoScopeRow(x.p,x.i)).join('');
+    const userRows=idx('user').map(x=>gpoScopeRow(x.p,x.i)).join('');
+    content=`
+      <h4 style="margin:.6rem 0 .3rem;color:var(--dim)">🖥 Computers (${scope.affected_computers})</h4>
+      ${compRows?`<div class="memwrap"><table><tbody>${compRows}</tbody></table></div>`:'<div class="none">None.</div>'}
+      <h4 style="margin:1rem 0 .3rem;color:var(--dim)">👤 Users (${scope.affected_users})</h4>
+      ${userRows?`<div class="memwrap"><table><tbody>${userRows}</tbody></table></div>`:'<div class="none">None.</div>'}`;
+  }else{
+    let items=[];
+    if(gpoScopeFilter!=='users')items=items.concat((scope.computers||[]).map(p=>p.label));
+    if(gpoScopeFilter!=='computers')items=items.concat((scope.users||[]).map(p=>p.label));
+    content=`<textarea id="scopeListArea" readonly onclick="this.select()"
+        style="width:100%;height:280px;font-family:monospace;font-size:.85rem;box-sizing:border-box">${esc(items.join('\n'))}</textarea>
+      <div class="meta" style="margin-top:.3rem">${items.length} name${items.length===1?'':'s'} — click the box to select all, or use Copy above.</div>`;
+  }
+  document.getElementById('modalBody').innerHTML=`
+    <h3>🔗 GPO scope — ${esc(gpoLabel)}</h3>
+    <div class="sub">Linked to:</div>
+    <div class="memwrap"><table><thead><tr><th>Reach</th><th>Linked to</th><th>Class</th></tr></thead><tbody>${linkedRows}</tbody></table></div>
+    ${modeToggle}
+    ${content}`;
+}
+function selectScopePrincipal(i){
+  const p=window._scopeAll&&window._scopeAll[i]; if(!p)return;
+  closeModal();
+  selectPrincipal(p.key,null);
+}
+function copyScopeList(){
+  const ta=document.getElementById('scopeListArea'); if(!ta)return;
+  ta.select();
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    navigator.clipboard.writeText(ta.value).catch(()=>document.execCommand('copy'));
+  }else{
+    document.execCommand('copy');
+  }
+}
+function templateDetailSection(su,detail){
+  // Full certipy-`find`-style dump for a certificate-template subject: every
+  // decoded flag, EKU, and — first and most prominent — exactly which ESC
+  // conditions matched and why. Absent for non-template subjects.
+  if(su.object_class!=='pKICertificateTemplate'||!detail||!detail.name)return '';
+  const vulns=detail.vulnerabilities||[];
+  const vulnHtml=vulns.length
+    ? vulns.map(v=>`<div class="advBlock" style="border-left:3px solid var(--crit,#e5484d);margin-bottom:.6rem">
+        <h4><span class="sev ${v.severity}">${esc(v.esc)}</span></h4>
+        <p>${esc(v.detail)}</p>
+        <ul style="margin:.3rem 0 0 1.1rem;padding:0">${(v.reasons||[]).map(r=>`<li>${esc(r)}</li>`).join('')}</ul>
+      </div>`).join('')
+    : '<div class="none">No ESC conditions matched for this template.</div>';
+  const flagRow=(label,names,raw)=>{
+    if(!names.length && !raw) return '';
+    const val=names.length?names.join(', '):(detail.flags_decoded?'(none set)':`0x${raw.toString(16)} (install certipy-ad for named flags)`);
+    return `<tr><td class="rt">${esc(label)}</td><td>${esc(val)}</td></tr>`;
+  };
+  const boolRow=(label,val,warnIfTrue)=>
+    `<tr><td class="rt">${esc(label)}</td><td>${val
+      ?`<span class="${warnIfTrue?'broad':''}">${warnIfTrue?'⚠ ':''}True</span>`:'False'}</td></tr>`;
+  const ekuList=detail.ekus&&detail.ekus.length?detail.ekus.join(', '):'(none — implies Any Purpose)';
+  const policiesHtml=(detail.issuance_policies&&detail.issuance_policies.length)
+    ? `<table><thead><tr><th>OID</th><th>Linked Group</th></tr></thead><tbody>${
+        detail.issuance_policies.map(p=>`<tr><td class="scope">${esc(p.oid)}</td>
+          <td>${p.linked_group?esc(p.linked_group)+' <span class="broad">ESC13</span>':'<span class="none">none</span>'}</td></tr>`).join('')
+      }</tbody></table>` : '';
+  // enabled is a real tri-state: True (published by >=1 CA — matches real
+  // Certipy's own "Enabled" definition), False (exists in AD, not published
+  // by any collected CA — enrollment-based ESCs are gated off for exactly
+  // this reason, only ESC4/template-control findings can still appear),
+  // null (no CA-publication data collected at all — genuinely unknown, not
+  // the same as "disabled").
+  const enabledBadge=detail.enabled===true
+    ? `<span class="pill" style="background:#3a9e6a33;color:#7fdcaa" title="Published by >=1 CA — issuable">✓ Enabled</span>`
+    : detail.enabled===false
+    ? `<span class="broad" title="Not published by any collected CA — enrollment-based ESCs (1/2/3/9/13/15/17) don't apply until it's published; ESC4/writable-object findings still can">✗ Disabled</span>`
+    : `<span class="pill" title="No CA publication data collected — can't tell if this is actually issuable">? Unknown</span>`;
+  return `
+    <div class="dir adcs" style="border-left:3px solid var(--crit,#e5484d)">
+      <h3>⚠ ADCS Vulnerabilities (${vulns.length}) ${enabledBadge}</h3>
+      ${vulnHtml}
+    </div>
+    <div class="dir">
+      <h3>🎗 Template Configuration</h3>
+      <table><tbody>
+        <tr><td class="rt">Enabled</td><td>${enabledBadge}</td></tr>
+        <tr><td class="rt">Schema Version</td><td>${detail.schema_version}</td></tr>
+        <tr><td class="rt">Published by CA(s)</td><td>${detail.published_by&&detail.published_by.length?esc(detail.published_by.join(', ')):'<span class="none">not linked to a collected CA</span>'}</td></tr>
+        <tr><td class="rt">Extended Key Usage</td><td>${esc(ekuList)}</td></tr>
+        ${boolRow('Any Purpose',detail.any_purpose)}
+        ${boolRow('Certificate Request Agent (Enrollment Agent)',detail.enrollment_agent)}
+        ${boolRow('Server Authentication',detail.server_authentication)}
+        ${boolRow('Enrollee Supplies Subject',detail.enrollee_supplies_subject,true)}
+        ${boolRow('Requires Manager Approval',detail.manager_approval)}
+        <tr><td class="rt">Authorized Signatures Required</td><td>${detail.authorized_signatures_required}</td></tr>
+        ${boolRow('No Security Extension (ESC9)',detail.no_security_extension,true)}
+        ${flagRow('Certificate Name Flag',detail.name_flags,detail.name_flag_raw)}
+        ${flagRow('Enrollment Flag',detail.enrollment_flags,detail.enrollment_flag_raw)}
+        ${flagRow('Private Key Flag',detail.private_key_flags,detail.private_key_flag_raw)}
+      </tbody></table>
+      ${policiesHtml?`<h4 style="margin:.8rem 0 .3rem;color:var(--dim)">Issuance Policies</h4>${policiesHtml}`:''}
+    </div>
+    <div class="dir"><h3>🔑 Enrollment &amp; Object-Control Permissions</h3>
+      <div class="meta">Who can enroll or reconfigure this template — see the Inbound table below (every ACE on the template object, incl. Certificate-Enrollment / AutoEnroll / WriteDacl / WriteOwner rights).</div>
+    </div>`;
+}
+function caDetailSection(su,detail){
+  // Registry-derived CA config (ESC6/7/8/11/16) for a CA subject — NOT LDAP
+  // data, needs the opt-in --adcs-ca-config scan flag (SMB+RRP to the CA's
+  // own host). Absent for non-CA subjects.
+  if(su.object_class!=='pKIEnrollmentService'||!detail||detail.collected===undefined)return '';
+  const vulns=detail.vulnerabilities||[];
+  const vulnHtml=vulns.length
+    ? vulns.map(v=>`<div class="advBlock" style="border-left:3px solid var(--crit,#e5484d);margin-bottom:.6rem">
+        <h4><span class="sev ${v.severity}">${esc(v.esc)}</span></h4>
+        <p>${esc(v.detail)}</p>
+        <ul style="margin:.3rem 0 0 1.1rem;padding:0">${(v.reasons||[]).map(r=>`<li>${esc(r)}</li>`).join('')}</ul>
+      </div>`).join('')
+    : '<div class="none">No ESC conditions matched for this CA.</div>';
+  if(!detail.collected){
+    return `<div class="dir adcs" style="border-left:3px solid var(--crit,#e5484d)">
+      <h3>⚠ ADCS Vulnerabilities (${vulns.length})</h3>
+      ${vulnHtml}
+      <div class="none" style="margin-top:.6rem">CA registry config (ESC6/ESC7/ESC11/ESC16) not collected —
+        re-run the scan with <code class="mono">--adcs-ca-config</code> to connect to this CA's own host
+        over SMB and read EditFlags/InterfaceFlags/DisableExtensionList/its security descriptor,
+        plus an HTTP probe for the ESC8 Web-Enrollment exposure indicator.</div>
+    </div>`;
+  }
+  const boolRow=(label,val,warnIfTrue)=>
+    `<tr><td class="rt">${esc(label)}</td><td>${val
+      ?`<span class="${warnIfTrue?'broad':''}">${warnIfTrue?'⚠ ':''}True</span>`:'False'}</td></tr>`;
+  const secRows=(detail.security_aces||[]).map(a=>`<tr>
+    <td class="rt">${esc(a.label)}</td><td>${esc((a.rights||[]).join(', '))}</td></tr>`).join('');
+  const httpVal=detail.web_enrollment_http===true?'<span class="broad">⚠ Reachable over HTTP</span>'
+    :detail.web_enrollment_http===false?'Not reachable':'<span class="none">unknown (probe failed)</span>';
+  // Registry (ESC6/7/11/16) and web-enrollment (ESC8) are collected
+  // independently — Remote Registry not running on the CA host is common
+  // (it's a Manual/Trigger-Start service) and unrelated to whether the CA
+  // answers HTTP, so one can fail while the other succeeds.
+  const registryNote=detail.registry_collected?'':`<div class="none" style="margin:.4rem 0">
+      Registry portion (EditFlags/InterfaceFlags/DisableExtensionList/Security — ESC6/ESC7/ESC11/ESC16)
+      could not be read — commonly means Remote Registry isn't running on this CA host. The fields
+      below default to "not vulnerable" rather than reflecting reality; only Web Enrollment (ESC8,
+      a separate HTTP probe) is trustworthy here.</div>`;
+  return `
+    <div class="dir adcs" style="border-left:3px solid var(--crit,#e5484d)">
+      <h3>⚠ ADCS Vulnerabilities (${vulns.length})</h3>
+      ${vulnHtml}
+    </div>
+    <div class="dir">
+      <h3>🎗 CA Configuration (registry, via --adcs-ca-config)</h3>
+      ${registryNote}
+      <table><tbody>
+        <tr><td class="rt">Publishes Template(s)</td><td>${detail.published_templates.length?esc(detail.published_templates.join(', ')):'<span class="none">none</span>'}</td></tr>
+        ${boolRow('Enrollee Can Specify SAN (EDITF_ATTRIBUTESUBJECTALTNAME2)',detail.san_via_request_attributes,true)}
+        ${boolRow('Enforces RPC Encryption',detail.enforce_encryption,false)}
+        <tr><td class="rt">Web Enrollment (HTTP)</td><td>${httpVal}</td></tr>
+        ${boolRow('SID Security Extension Disabled (all templates)',detail.security_extension_disabled,true)}
+        <tr><td class="rt">Disabled Extensions</td><td>${detail.disabled_extensions.length?esc(detail.disabled_extensions.join(', ')):'<span class="none">none</span>'}</td></tr>
+      </tbody></table>
+      <h4 style="margin:.8rem 0 .3rem;color:var(--dim)">CA Security (ManageCa / ManageCertificates / Enroll)</h4>
+      ${secRows?`<table><thead><tr><th>Principal</th><th>Rights</th></tr></thead><tbody>${secRows}</tbody></table>`:'<div class="none">No security ACEs read.</div>'}
+    </div>`;
 }
 function adcsSection(adcs){
   // ADCS ESC findings this subject can abuse. Absent when none.
@@ -396,6 +578,8 @@ function renderDetail(s,key){
       ${su.materialized?`<span class="pill" style="align-self:center" title="Reconstructed from host-plane local-admin/RDP membership — was not collected as its own AD object (e.g. a gMSA out of collection scope)">reconstructed</span>`:''}
       ${(su.flags||[]).map(f=>`<span class="pill" style="align-self:center">${esc(f)}</span>`).join('')}
     </div>
+    ${templateDetailSection(su,s.template_detail)}
+    ${caDetailSection(su,s.ca_detail)}
     <div class="dir path" id="pathsSection">
       <h3>⛓ Attack paths to Tier-0
         <span class="phdr">
@@ -410,6 +594,7 @@ function renderDetail(s,key){
       </h3>
       <div id="pathsBody"><div class="none">Click “Find paths” to chain control edges from ${esc(su.label)} to Domain/Enterprise Admins &amp; the domain root.</div></div>
     </div>
+    ${gpoScopeSection(su,s.gpo_scope)}
     <div class="dir out"><h3>⇢ Outbound — what ${esc(su.label)} can control</h3>${edgeTable(s.outbound,'out')}</div>
     <div class="dir in"><h3>⇠ Inbound — who can control ${esc(su.label)}</h3>${edgeTable(s.inbound,'in')}</div>
     ${reachSection(su,s.local_admin_rdp)}
@@ -537,10 +722,12 @@ function chainSvg(chain,right){
       parts.push(`<line x1="${px}" y1="${ay}" x2="${x-6}" y2="${ay}" stroke="${isTarget?'#e5484d':'#666'}" stroke-width="1.5" marker-end="url(#arw${isTarget?'r':''})"/>`);
       // <title> keeps the full untruncated right on hover.
       parts.push(`<text x="${(px+x)/2}" y="${ay-7}" fill="${lblCol}" font-size="9.5" font-weight="${isTarget?'700':'400'}" text-anchor="middle">${isTarget?`<title>${esc(right)}</title>`:''}${esc(lblTxt)}</text>`);}
-    parts.push(`<rect x="${x}" y="${y}" width="${bw}" height="${boxH}" rx="7" fill="${col}22" stroke="${col}" stroke-width="1.4"/>`);
+    const t0=node.tier0;
+    parts.push(`<rect x="${x}" y="${y}" width="${bw}" height="${boxH}" rx="7" fill="${col}22" stroke="${t0?'#e5484d':col}" stroke-width="${t0?'2.5':'1.4'}"/>`);
+    if(t0)parts.push(`<title>Controlling this reaches Tier-0: ${esc(t0)}</title>`);
     parts.push(`<text x="${cx}" y="${y+19}" fill="#e7e7ea" font-size="11" font-weight="600" text-anchor="middle">${esc(node.label)}</text>`);
     parts.push(`<text x="${cx}" y="${y+33}" fill="${col}" font-size="9" text-anchor="middle">${esc(node.class)}</text>`);
-    parts.push(`<text x="${cx}" y="${y+boxH+13}" fill="#8b8d93" font-size="8.5" text-anchor="middle">${esc(node.note||node.role)}</text>`);
+    parts.push(`<text x="${cx}" y="${y+boxH+13}" fill="${t0?'#e5484d':'#8b8d93'}" font-size="8.5" font-weight="${t0?'700':'400'}" text-anchor="middle">${t0?'⚠ TIER-0':esc(node.note||node.role)}</text>`);
   });
   parts.push('<defs>'
     +'<marker id="arw" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#666"/></marker>'
@@ -564,12 +751,16 @@ async function openEdge(dir,i){
     ? `<pre class="cmds">${a.commands.map(c=>esc(c)).join('\n')}</pre>` : '';
   const opsec=a.opsec?`<div class="advBlock ops"><h4>◈ OPSEC / detection</h4><p>${esc(a.opsec)}</p></div>`:'';
   const bh=a.bh_link?`<a class="bhlink" href="${esc(a.bh_link)}" target="_blank" rel="noopener">BloodHound edge docs ↗</a>`:'';
+  const tier0banner=d.target_tier0?`<div class="advBlock" style="border-left:3px solid #e5484d">
+      <h4 style="color:#e5484d">⚠ Reaches Tier-0</h4>
+      <p>${esc(d.target_tier0)}</p></div>`:'';
   body.innerHTML=`
     <h3><span class="sev ${e.severity}">${e.severity}</span> ${esc(e.right)}</h3>
     <div class="sub">${dir==='out'?'This principal controls':'Controlled by'} <b>${esc(d.target_label)}</b>
       ${e.applies_to?`· scope: ${esc(e.applies_to)}`:''}${e.broad?' · <span class="broad">BROAD</span>':''}${e.builtin_noise?' · <span class="pill">built-in</span>':''}
       ${bh}</div>
     ${chainSvg(d.chain,e.right)}
+    ${tier0banner}
     <div class="advBlock sum"><h4>What it means</h4><p>${esc(a.summary)}</p></div>
     <div class="advBlock off"><h4>⚔ Recommended attack path</h4><p>${esc(a.offense)}</p>${cmds}</div>
     ${opsec}
@@ -642,8 +833,8 @@ function selectMember(i){
   selectPrincipal(m.key,null);   // loads that member's own detail view
 }
 
-function toggleCollect(){
-  const b=document.getElementById('collectBody');const c=document.getElementById('collectCaret');
+function toggleRunPanel(){
+  const b=document.getElementById('runBody');const c=document.getElementById('runCaret');
   const hidden=b.style.display==='none';b.style.display=hidden?'block':'none';c.textContent=hidden?'▾':'▸';
 }
 function toggleQueries(){
@@ -723,35 +914,17 @@ function toggleMembers(rowEl,p,subEl){
   }
   subEl.dataset.filled='1';
 }
-async function applyPrefill(){
-  try{
-    const r=await fetch('/api/prefill');const p=await r.json();
-    if(!p.has_creds)return;
-    const set=(id,v)=>{const el=document.getElementById(id);if(el!=null&&v!=null&&v!=='')el.value=v;};
-    set('dc',p.dc);set('username',p.username);set('domain',p.domain);
-    set('password',p.password);set('nthash',p.nthash);set('aes_key',p.aes_key);set('dc_ip',p.dc_ip);
-    document.getElementById('kerberos').checked=!!p.kerberos;
-    document.getElementById('ldaps').checked=!!p.ldaps;
-    document.getElementById('gpo').checked=p.gpo!==false;
-    if(p.host_mode){const hm=document.getElementById('host_mode');hm.value=p.host_mode;
-      document.getElementById('hostsRow').style.display=p.host_mode==='list'?'block':'none';set('hosts',p.hosts);}
-    if(p.autostart){
-      // creds came from the CLI — start collecting immediately and collapse the form
-      appendLog('[prefill] credentials supplied on command line — auto-starting collection','info');
-      startCollect();
-      document.getElementById('collectBody').style.display='none';
-      document.getElementById('collectCaret').textContent='▸';
-    }
-  }catch(e){/* no prefill endpoint / GUI opened standalone */}
-}
-// Boot sequence. If a store is ALREADY loaded server-side on first paint — e.g.
-// the CLI preloaded a BloodHound file (--bloodhound), or the page was refreshed
-// after data was collected — populate the principals list and queries too, so the
-// left panel isn't stuck on the "collect first" placeholder while data exists.
+// Boot sequence. If a run was ALREADY loaded server-side on first paint — e.g.
+// adcontrol_web.py was started with --run/--latest, or the page was refreshed
+// after a run was loaded — populate the principals list and queries too, so the
+// left panel isn't stuck on the "load a run" placeholder while data exists.
 (async function boot(){
   const s=await refreshStatus();
-  loadSessions();loadQueries();applyPrefill();
-  if(s&&s.collected){loadPrincipals('');refreshQuery();}
+  loadRuns();loadQueries();
+  if(s&&s.collected){
+    document.getElementById('runDesc').textContent=`Loaded run ${s.run_id} — ${s.domain}, ${s.count} objects, ${s.principals} principals.`;
+    loadPrincipals('');refreshQuery();
+  }
 })();
 </script>
 </body>

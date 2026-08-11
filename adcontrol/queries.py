@@ -29,6 +29,8 @@ def _friendly(object_class: str) -> str:
         "user": "user", "group": "group", "computer": "computer",
         "groupPolicyContainer": "gpo", "organizationalUnit": "ou",
         "domain": "domain", "container": "container",
+        "pKICertificateTemplate": "template",
+        "pKIEnrollmentService": "ca",
     }.get(object_class, "other")
 
 
@@ -350,23 +352,39 @@ def q_enabled_admincount(store, az):
 
 
 def q_adcs_esc(store, az):
-    """ADCS certificate-template misconfigurations (ESC1–ESC4), one row per
-    finding. Row carries the template as the 'principal' and the enrollers/ESC in
-    the note; extra fields (esc, template, enrollers, reasons) let the report
+    """ADCS misconfigurations (ESC1/2/3/4/5/9/13/14/15/17 — every ESC condition
+    derivable from LDAP-readable AD attributes/ACLs; see adcs.py's module
+    docstring for what's excluded and why), one row per finding. Row carries
+    the template (or PKI-infra object / account, for ESC5/ESC14) as the
+    'principal' and the enrollers/ESC in the note; extra fields (esc, template,
+    enrollers, reasons) let the report
     render richer detail. Ordered by ESC id."""
     from adcontrol import adcs as adcs_mod
     findings = getattr(store, "adcs_findings", None)
     if not findings:
         adcs_mod.analyze_adcs(store, az)
         findings = store.adcs_findings
+    has_pub_data = adcs_mod._has_publication_data(store)
     out = []
     for f in findings:
         actors = ", ".join(f.enrollers[:6]) + ("…" if len(f.enrollers) > 6 else "")
+        # "enabled" = is this template actually published by a CA (real
+        # Certipy's own definition) — meaningful only for template-shaped
+        # findings (ESC1/2/3/4/9/13/15/17); None for ESC5 (a PKI-infra object,
+        # not a template) / ESC14 (an account, not a template) rows, and when
+        # we don't have real publication data to judge by (see
+        # _has_publication_data — was previously hardcoded True regardless).
+        target = store.by_dn(f.template_dn) if f.template_dn else None
+        if target is not None and target.object_class == "pKICertificateTemplate":
+            enabled_val = bool(adcs_mod.published_by(store, target)) if has_pub_data else None
+        else:
+            enabled_val = None
         out.append({
             "key": f.template_dn or f.template, "label": f.template,
             "class": "gpo" if False else "adcs", "object_class": "",
-            "dn": f.template_dn, "enabled": True, "admin_count": 0,
-            "note": f"{f.esc} — abusable by: {actors}",
+            "dn": f.template_dn, "enabled": enabled_val, "admin_count": 0,
+            "note": f"{f.esc} — abusable by: {actors}"
+                   + (" (template not published by any CA)" if enabled_val is False else ""),
             "esc": f.esc, "template": f.template, "severity": f.severity,
             "detail": f.detail, "reasons": f.reasons,
             "enrollers": f.enrollers, "enroller_sids": f.enroller_sids,
@@ -420,8 +438,10 @@ QUERY_REGISTRY = {
         q_enabled_admincount),
     "adcs_esc": (
         "ADCS ESC misconfigurations",
-        "Vulnerable certificate templates (ESC1–ESC4) — enrollee-supplies-subject, "
-        "any-purpose/enrollment-agent EKUs, or writable template objects.",
+        "Vulnerable certificate templates and PKI objects (ESC1/2/3/4/5/9/13/14/15/17) "
+        "— enrollee-supplies-subject, any-purpose/enrollment-agent EKUs, writable "
+        "template/PKI-infra objects, missing SID extension, OID-group links, weak "
+        "explicit mappings, and V1/server-auth variants.",
         q_adcs_esc),
 }
 

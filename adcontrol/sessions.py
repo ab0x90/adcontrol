@@ -27,6 +27,7 @@ aborts the sweep. Opt-in only, exactly like ``hostrights`` (tier 3).
 from __future__ import annotations
 
 from adcontrol.model import Session
+from adcontrol.smbauth import is_access_denied
 
 
 # Accounts that are never interesting as a "session" (machine/service noise).
@@ -88,7 +89,11 @@ def _netwksta_users(smb, host, log):
                 out.append((name, dom))
         dce.disconnect()
     except Exception as e:
-        log(f"[sess] {host}: NetWkstaUserEnum failed: {e}", "info")
+        if is_access_denied(e):
+            log(f"[sess] {host}: NetWkstaUserEnum access denied — scan account is "
+                "likely not a local admin on this host (this call requires it)", "info")
+        else:
+            log(f"[sess] {host}: NetWkstaUserEnum failed: {e}", "info")
     return out
 
 
@@ -107,7 +112,12 @@ def _netsession_users(smb, host, log):
                 out.append(name)
         dce.disconnect()
     except Exception as e:
-        log(f"[sess] {host}: NetSessionEnum failed: {e}", "info")
+        if is_access_denied(e):
+            log(f"[sess] {host}: NetSessionEnum access denied — scan account is "
+                "likely not a local admin on this host (modern Windows restricts "
+                "this call to admins by default)", "info")
+        else:
+            log(f"[sess] {host}: NetSessionEnum failed: {e}", "info")
     return out
 
 
@@ -131,6 +141,7 @@ def collect_sessions(store, smb_creds, hosts, log=None) -> int:
         if not host_sid:
             log(f"[sess] {host}: not a collected computer — skipped", "info")
             continue
+        log(f"[sess] -> {host}", "info")
         smb = smb_creds.connect(host, ip)
         if not smb:
             continue
@@ -162,6 +173,7 @@ def collect_sessions(store, smb_creds, hosts, log=None) -> int:
             smb.close()
         except Exception:
             pass
+        log(f"[sess] done {host}", "info")
     store.build_session_indexes()
     log(f"[sess] collected {added} logon session(s)", "info")
     return added

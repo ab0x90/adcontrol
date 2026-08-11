@@ -11,8 +11,10 @@ dist/
 venv/
 env/
 
-# Runtime data — collected AD sessions are pickles (do not commit; can be large
-# and contain domain data). Recreated at runtime.
+# Runtime data — adcontrol_scan.py writes each run's pickled ObjectStore +
+# log + metadata to its own loot/<run_id>/ dir. Real domain data, never meant
+# to be committed. (adcontrol_sessions/ is the old pre-split location.)
+loot/
 adcontrol_sessions/
 *.pkl
 
@@ -26,6 +28,11 @@ reports/
 # BloodHound/SharpHound zip collections imported via --bloodhound — real
 # domain data, never meant to be committed
 *.zip
+
+# Real certipy-ad scan output, kept locally for comparing against adcontrol's
+# own ESC detection — real domain data (CA names, template ACLs, SIDs)
+*_Certipy.txt
+*_Certipy.json
 
 # Editor / OS
 .vscode/

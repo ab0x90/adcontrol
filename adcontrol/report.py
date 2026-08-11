@@ -56,16 +56,24 @@ def _session_rows(store, subject):
     return rows
 
 
-def _edge_rows_md(edges, direction):
+def _edge_rows_md(edges, direction, tier0_map=None):
     if not edges:
         return "_None._\n"
+    tier0_map = tier0_map or {}
     lines = ["| Severity | Right | " + ("Target" if direction == "out" else "Principal")
              + " | Class | Via | Scope |",
              "|---|---|---|---|---|---|"]
     for e in edges:
         who = e.target_label if direction == "out" else e.source_label
+        t0 = tier0_map.get(e.target_dn)
+        if t0:
+            who += " **⚠ TIER-0**"
         scope = e.applies_to or "whole object"
         lines.append(f"| {e.severity} | {e.right} | {who} | {e.target_class} | {e.via} | {scope} |")
+    if any(tier0_map.get(e.target_dn) for e in edges):
+        lines.append("")
+        lines.append("_⚠ TIER-0 = controlling this target is itself a one-hop win "
+                     "(built-in admin group, DC, domain root, or a GPO linked to Tier-0 scope)._")
     return "\n".join(lines) + "\n"
 
 
@@ -100,9 +108,11 @@ def to_markdown(store, subject: RawObject, analyzer: Analyzer | None = None) -> 
     if subj.get("flags"):
         out.append(f"- **Account flags:** {', '.join(subj['flags'])}")
     out.append("")
+    out.append(_gpo_scope_section_md(subject, s["gpo_scope"]))
+    tier0_map = analyzer.tier0_targets()
     out.append(f"## Outbound control — what {subj['label']} can control  "
                f"({len(s['outbound'])} edges, {s['outbound_high']} high)\n")
-    out.append(_edge_rows_md(s["outbound"], "out"))
+    out.append(_edge_rows_md(s["outbound"], "out", tier0_map))
     already, paths = _compute_paths(store, subject, analyzer)
     out.append(f"\n## Attack paths to Tier-0  ({len(paths)})\n")
     out.append("_Multi-hop control chains from this principal to Domain/Enterprise "
@@ -121,7 +131,7 @@ def to_markdown(store, subject: RawObject, analyzer: Analyzer | None = None) -> 
         out.append("")
     out.append(f"\n## Inbound control — who can control {subj['label']}  "
                f"({len(s['inbound'])} edges, {s['inbound_high']} high)\n")
-    out.append(_edge_rows_md(s["inbound"], "in"))
+    out.append(_edge_rows_md(s["inbound"], "in", tier0_map))
     sess = _session_rows(store, subject)
     if subject.object_class in ("user", "computer"):
         out.append(f"\n## Logon sessions  ({len(sess)})\n")
@@ -166,25 +176,34 @@ def to_markdown(store, subject: RawObject, analyzer: Analyzer | None = None) -> 
     return "\n".join(out) + "\n"
 
 
-def _edge_rows_html(edges, direction):
+def _edge_rows_html(edges, direction, tier0_map=None):
     if not edges:
         return '<p class="none">None.</p>'
+    tier0_map = tier0_map or {}
     head = "Target" if direction == "out" else "Principal"
     rows = []
+    any_tier0 = False
     for e in edges:
         who = html.escape(e.target_label if direction == "out" else e.source_label)
         scope = html.escape(e.applies_to or "whole object")
         color = _SEV_COLOR.get(e.severity, "#888")
         badge = ' <span class="broad">BROAD</span>' if e.broad else ""
+        t0 = tier0_map.get(e.target_dn)
+        if t0:
+            any_tier0 = True
+            badge += f' <span class="broad" style="background:#e5484d" title="{html.escape(t0)}">⚠ TIER-0</span>'
         rows.append(
             f'<tr><td><span class="sev" style="background:{color}">{e.severity}</span></td>'
             f'<td class="right">{html.escape(e.right)}</td>'
             f'<td>{who}{badge}</td><td>{html.escape(e.target_class)}</td>'
             f'<td>{html.escape(e.via)}</td><td class="scope">{scope}</td></tr>'
         )
+    note = ('<p class="meta">⚠ TIER-0 = controlling this target is itself a one-hop '
+            'win (built-in admin group, DC, domain root, or a GPO linked to Tier-0 '
+            'scope).</p>') if any_tier0 else ""
     return (f'<table><thead><tr><th>Severity</th><th>Right</th><th>{head}</th>'
             f'<th>Class</th><th>Via</th><th>Scope</th></tr></thead>'
-            f'<tbody>{"".join(rows)}</tbody></table>')
+            f'<tbody>{"".join(rows)}</tbody></table>{note}')
 
 
 def _sessions_html(store, subject):
@@ -275,6 +294,62 @@ def _reach_section_html(subject, reach):
             '<div class="tableWrap">' + _reach_rows_html(rdp, "RDP access") + '</div>')
 
 
+def _gpo_scope_section_html(subject, scope):
+    """Where a GPO is linked and what falls under that — GPO subjects only.
+    Shown regardless of whether the GPO pushes a tracked SecEdit/Restricted-
+    Groups setting (see the GPO-delivered-rights section below, which stays
+    empty for a GPO that e.g. only sets a wallpaper even when it's linked
+    straight to the DCs)."""
+    if subject.object_class != "groupPolicyContainer":
+        return ""
+    linked = (scope or {}).get("linked") or []
+    if not linked:
+        return ('<h2>🔗 GPO scope</h2>'
+                '<p class="none">Not linked to any OU/domain (gPLink data absent '
+                'or GPO unlinked).</p>')
+    rows = "".join(
+        f'<tr><td class="right">{html.escape(l["reach"])}</td>'
+        f'<td>{html.escape(l["label"])}</td>'
+        f'<td class="scope">{html.escape(l["class"])}</td></tr>'
+        for l in linked)
+    tier0 = scope.get("affected_tier0") or []
+    tier0_note = (f' — <b>includes Tier-0:</b> {html.escape(", ".join(tier0))}'
+                  if tier0 else "")
+    return ('<h2>🔗 GPO scope</h2>'
+            '<p class="meta">OUs/domain this GPO is linked to, and what falls '
+            'under that scope — controlling this GPO means pushing code '
+            '(scheduled/immediate tasks, scripts, Restricted-Groups changes) '
+            'to everything listed here, regardless of what the GPO itself '
+            'currently configures.</p>'
+            '<div class="tableWrap"><table><thead><tr><th>Reach</th>'
+            '<th>Linked to</th><th>Class</th></tr></thead>'
+            f'<tbody>{rows}</tbody></table></div>'
+            f'<p class="meta">{scope["affected_computers"]} computer(s), '
+            f'{scope["affected_users"]} user(s) in scope{tier0_note}</p>')
+
+
+def _gpo_scope_section_md(subject, scope):
+    if subject.object_class != "groupPolicyContainer":
+        return ""
+    linked = (scope or {}).get("linked") or []
+    out = ["\n## 🔗 GPO scope\n"]
+    if not linked:
+        out.append("_Not linked to any OU/domain (gPLink data absent or GPO unlinked)._\n")
+        return "\n".join(out)
+    out.append("_OUs/domain this GPO is linked to, and what falls under that "
+               "scope — controlling this GPO means pushing code to everything "
+               "listed here, regardless of what it currently configures._\n")
+    out.append("| Reach | Linked to | Class |")
+    out.append("|---|---|---|")
+    for l in linked:
+        out.append(f"| {l['reach']} | {l['label']} | {l['class']} |")
+    tier0 = scope.get("affected_tier0") or []
+    tier0_note = f" — **includes Tier-0:** {', '.join(tier0)}" if tier0 else ""
+    out.append(f"\n{scope['affected_computers']} computer(s), "
+               f"{scope['affected_users']} user(s) in scope{tier0_note}\n")
+    return "\n".join(out)
+
+
 def _adcs_section_html(adcs):
     """ADCS ESC abuse section — only when the subject can abuse a vuln template."""
     if not adcs:
@@ -339,6 +414,7 @@ def to_html(store, subject: RawObject, analyzer: Analyzer | None = None) -> str:
     for fl in subj.get("flags", []):
         badges.append(f'<span class="pill">{html.escape(fl)}</span>')
     badges_html = ("<p>" + " ".join(badges) + "</p>") if badges else ""
+    tier0_map = analyzer.tier0_targets()
     extra = ('<h2>GPO-delivered &amp; per-host RDP / logon rights</h2>'
              '<p class="meta">Rights this principal (or a group it belongs to) '
              'gains from Group Policy or local host membership — separate from '
@@ -398,15 +474,16 @@ th{{background:#f3f3f5;font-weight:600}}
 <b>Class:</b> {html.escape(subj['class'])} · <b>Enabled:</b> {subj['enabled']} · <b>adminCount:</b> {subj['admin_count']}</p>
 {badges_html}
 {spn}
+{_gpo_scope_section_html(subject, s['gpo_scope'])}
 <h2>Outbound control — what {html.escape(subj['label'])} can control</h2>
-<div class="tableWrap">{_edge_rows_html(s['outbound'], 'out')}</div>
+<div class="tableWrap">{_edge_rows_html(s['outbound'], 'out', tier0_map)}</div>
 <h2>Attack paths to Tier-0</h2>
 <p class="meta">Multi-hop control chains from this principal to Domain/Enterprise
 Admins or the domain root. Each hop is a control edge pivoted through —
 controlling a principal lets you act as it. Shortest path per target.</p>
 {_paths_html(*_compute_paths(store, subject, analyzer))}
 <h2>Inbound control — who can control {html.escape(subj['label'])}</h2>
-<div class="tableWrap">{_edge_rows_html(s['inbound'], 'in')}</div>
+<div class="tableWrap">{_edge_rows_html(s['inbound'], 'in', tier0_map)}</div>
 {_reach_section_html(subject, s['local_admin_rdp'])}
 {_adcs_section_html(s['adcs'])}
 {_sessions_section_html(store, subject)}

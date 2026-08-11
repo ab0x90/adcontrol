@@ -28,10 +28,17 @@ _ATTRS = [
     # delegation / staleness / creds-in-description (analysis extras).
     "msDS-AllowedToDelegateTo", "sIDHistory", "description",
     "pwdLastSet", "lastLogonTimestamp",
-    # ADCS certificate-template attributes (ESC1-ESC3 conditions).
+    # ADCS certificate-template attributes (ESC1/2/3/9/13/15/17 conditions).
     "msPKI-Certificate-Name-Flag", "msPKI-Enrollment-Flag", "msPKI-RA-Signature",
     "msPKI-Template-Schema-Version", "pKIExtendedKeyUsage",
-    "msPKI-Certificate-Application-Policy",
+    "msPKI-Certificate-Application-Policy", "msPKI-Certificate-Policy",
+    "msPKI-Private-Key-Flag",
+    # ADCS OID objects (ESC13: issuance-policy OID -> AD group link).
+    "msDS-OIDToGroupLink", "msPKI-Cert-Template-OID",
+    # Which CA(s) publish a template (pKIEnrollmentService's own attribute).
+    "certificateTemplates",
+    # Explicit certificate mapping on accounts (ESC14).
+    "altSecurityIdentities",
 ]
 
 # One filter that captures every principal + container we care about controlling.
@@ -103,7 +110,7 @@ def collect_schema_guids(client) -> dict:
     names: dict[str, str] = {}
     # Schema attributes/classes carry schemaIDGUID.
     try:
-        schema_base = f"CN=Schema,CN=Configuration,{_root_dn(client.base_dn)}"
+        schema_base = f"CN=Schema,{client.config_naming_context()}"
         for rec in client.search("(|(objectClass=attributeSchema)(objectClass=classSchema))",
                                   ["lDAPDisplayName", "schemaIDGUID"],
                                   base=schema_base, want_sd=False):
@@ -117,7 +124,7 @@ def collect_schema_guids(client) -> dict:
         client.log(f"[collect] schema GUID map skipped: {e}", "info")
     # Extended rights carry rightsGuid (string form already).
     try:
-        er_base = f"CN=Extended-Rights,CN=Configuration,{_root_dn(client.base_dn)}"
+        er_base = f"CN=Extended-Rights,{client.config_naming_context()}"
         for rec in client.search("(objectClass=controlAccessRight)",
                                   ["displayName", "cn", "rightsGuid"],
                                   base=er_base, want_sd=False):
@@ -132,21 +139,31 @@ def collect_schema_guids(client) -> dict:
 
 
 def collect_adcs(client, store, log=None) -> int:
-    """Collect ADCS certificate templates + enrollment services (CAs) from the
-    Configuration NC's PKI container, with their DACLs, and normalize each
-    template's ESC-relevant attributes into ``obj.extra['adcs_template']``.
+    """Collect the whole ADCS PKI container from the Configuration NC — templates
+    and enrollment services (CAs), plus (for ESC5/ESC13) the surrounding infra
+    objects: the NTAuthCertificates/AIA/CDP/OID/Certificate-Templates/Enrollment-
+    Services/Certification-Authorities containers themselves, and individual OID
+    (issuance policy) objects — with their DACLs, and normalizes each template's
+    ESC-relevant attributes into ``obj.extra['adcs_template']``.
 
     Returns the number of ADCS objects added. Best-effort: if the PKI container
     isn't present (no ADCS) it logs and returns 0.
     """
     log = log or client.log
     from adcontrol import adcs as adcs_mod
-    pki_base = (f"CN=Public Key Services,CN=Services,CN=Configuration,"
-                f"{_root_dn(client.base_dn)}")
+    pki_base = f"CN=Public Key Services,CN=Services,{client.config_naming_context()}"
+    # `container` picks up the AIA/CDP/OID/Certificate Templates/Enrollment
+    # Services/KRA/Certification Authorities containers themselves (ESC5 targets)
+    # — safe here since the search is scoped to the small PKI subtree, not the
+    # whole directory. msPKI-Enterprise-Oid is an issuance-policy OID object
+    # (ESC13); cRLDistributionPoint covers CDP child objects.
     flt = ("(|(objectClass=pKICertificateTemplate)"
-           "(objectClass=pKIEnrollmentService)(objectClass=certificationAuthority))")
+           "(objectClass=pKIEnrollmentService)(objectClass=certificationAuthority)"
+           "(objectClass=msPKI-Enterprise-Oid)(objectClass=cRLDistributionPoint)"
+           "(objectClass=container))")
     attrs = _ATTRS  # includes the msPKI-* template attributes
     added = 0
+    oid_group_links: dict[str, str] = {}
     try:
         recs = list(client.search(flt, attrs, base=pki_base, want_sd=True))
     except Exception as e:
@@ -157,6 +174,7 @@ def collect_adcs(client, store, log=None) -> int:
         if not dn:
             continue
         classes = _as_list(rec.get("objectClass"))
+        cl_low = {str(c).lower() for c in classes}
         obj = RawObject(
             dn=dn, sid=_first(rec, "objectSid"), guid=_first(rec, "objectGUID"),
             sam=_first(rec, "sAMAccountName"),
@@ -164,6 +182,7 @@ def collect_adcs(client, store, log=None) -> int:
             object_class=_most_specific_class(classes),
             classes=[str(c) for c in classes],
         )
+        obj.extra["cn"] = _first(rec, "cn")
         blob = rec.get("nTSecurityDescriptor")
         if blob:
             owner, aces = sddl.parse_descriptor(blob, store.schema_guid_names)
@@ -171,9 +190,22 @@ def collect_adcs(client, store, log=None) -> int:
             obj.aces = aces
         if obj.object_class == "pKICertificateTemplate":
             obj.extra["adcs_template"] = adcs_mod.normalize_from_ldap(rec, _first)
+        if obj.object_class == "pKIEnrollmentService":
+            obj.extra["published_templates"] = _as_list(rec.get("certificateTemplates"))
+            dnsname = _first(rec, "dNSHostName")
+            if dnsname:
+                obj.extra["dns"] = dnsname
+        if "mspki-enterprise-oid" in cl_low:
+            obj.extra["oid_value"] = _first(rec, "msPKI-Cert-Template-OID")
+            group_dn = _first(rec, "msDS-OIDToGroupLink")
+            if group_dn:
+                obj.extra["oid_group_link"] = group_dn
+                if obj.extra["oid_value"]:
+                    oid_group_links[obj.extra["oid_value"]] = group_dn
         store.add(obj)
         added += 1
-    log(f"[adcs] collected {added} certificate template/CA object(s)", "info")
+    store.oid_group_links.update(oid_group_links)
+    log(f"[adcs] collected {added} certificate template/CA/PKI-infra object(s)", "info")
     return added
 
 
@@ -276,6 +308,10 @@ def collect(client, log=None, smb_creds=None, dc_host=None, dc_ip=None,
         if sidhist:
             obj.extra["sid_history"] = [sddl._sid_str(x) if isinstance(x, (bytes, bytearray))
                                         else str(x) for x in sidhist]
+        # Explicit certificate mapping (ESC14: weak altSecurityIdentities entries).
+        alt_sec = _as_list(rec.get("altSecurityIdentities"))
+        if alt_sec:
+            obj.extra["alt_security_identities"] = [str(x) for x in alt_sec]
         # Description often holds credentials in the wild.
         desc = _first(rec, "description")
         if desc:

@@ -9,6 +9,18 @@ way as the LDAP layer: password, pass-the-hash, or Kerberos.
 from __future__ import annotations
 
 
+def is_access_denied(exc: Exception) -> bool:
+    """True if *exc* is an impacket DCERPC access-denied fault (error code 5,
+    ``rpc_s_access_denied``) — the specific RPC method requires more than the
+    scan account has (e.g. NetWkstaUserEnum/NetSessionEnum/SAMR/LSA calls all
+    require local admin), distinct from an SMB login/auth failure."""
+    try:
+        from impacket.dcerpc.v5.rpcrt import DCERPCException
+    except ImportError:
+        return False
+    return isinstance(exc, DCERPCException) and getattr(exc, "error_code", None) == 5
+
+
 class SmbCreds:
     """Immutable-ish bundle of credentials + an impacket SMBConnection factory."""
 
