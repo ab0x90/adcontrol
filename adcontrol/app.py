@@ -1,61 +1,44 @@
 """
-Flask + SocketIO web GUI for adcontrol.
+Flask web GUI for adcontrol — READ-ONLY viewer/reporter.
 
-Default port 5006.
+This process never gathers data itself; all collection lives in
+`adcontrol_scan.py`, which writes finished runs to loot/<run_id>/. This app
+only ever loads a run from there for browsing/reporting.
+
 Flow:
-  1. POST /api/collect with DC + creds + auth options  -> background collect,
-     progress streamed over SocketIO 'log' events, 'done' on completion.
-  2. GET  /api/principals?q=  -> search collected principals.
-  3. GET  /api/analyze/<key> -> {subject, outbound[], inbound[]} (kept separate).
-  4. GET  /api/report/<key>?fmt=html|md -> downloadable scoped report.
-
-The collected ObjectStore lives in memory for the process lifetime; a pickle is
-also written to sessions/ so a collection can be reloaded without re-querying.
+  1. GET  /api/runs -> list loot/<run_id>/ runs available to load.
+  2. POST /api/load-run {run_id} -> load a run's ObjectStore into memory.
+  3. GET  /api/principals?q=  -> search the loaded run's principals.
+  4. GET  /api/analyze/<key> -> {subject, outbound[], inbound[]} (kept separate).
+  5. GET  /api/report/<key>?fmt=html|md -> downloadable scoped report.
 """
 
 from __future__ import annotations
 
 import os
-import pickle
-import threading
-import datetime
 
 from flask import Flask, request, jsonify, Response, send_from_directory
-from flask_socketio import SocketIO
 
-from adcontrol.connection import LdapClient
-from adcontrol import collector as collector_mod
 from adcontrol.analyze import Analyzer
 from adcontrol import report as report_mod
 from adcontrol.model import ObjectStore
-from adcontrol.smbauth import SmbCreds
-from adcontrol import hostrights as hr_mod
+from adcontrol import loot
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-SESS_DIR = os.path.join(os.path.dirname(BASE), "adcontrol_sessions")
-os.makedirs(SESS_DIR, exist_ok=True)
+ROOT = os.path.dirname(BASE)
 
 app = Flask(__name__, template_folder=os.path.join(BASE, "templates"))
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 STATE = {
     "store": None,        # type: ObjectStore | None
     "analyzer": None,     # type: Analyzer | None
-    "collecting": False,
-    "logs": [],
+    "run_id": None,        # type: str | None
+    "load_log": [],        # messages from the most recent run load (e.g. ADCS analysis)
 }
 
-# Credentials/params supplied on the CLI, used to pre-fill the collect form and
-# auto-start a collection on first page load. The real password is held here and
-# never sent to the browser — the form receives a sentinel and /api/collect
-# swaps it back in server-side.
-PREFILL = {}
-_PW_SENTINEL = "\x00__adcontrol_cli_pw__\x00"
 
-
-def _emit_log(msg, level="info"):
-    STATE["logs"].append({"msg": msg, "level": level})
-    socketio.emit("log", {"msg": msg, "level": level})
+def _load_log(msg, level="info"):
+    STATE["load_log"].append({"msg": msg, "level": level})
 
 
 def _set_analyzer(store, warm=True):
@@ -70,79 +53,39 @@ def _set_analyzer(store, warm=True):
             pass
     try:
         from adcontrol import adcs as adcs_mod
-        adcs_mod.analyze_adcs(store, az, log=_emit_log)
+        adcs_mod.analyze_adcs(store, az, log=_load_log)
     except Exception as e:
-        _emit_log(f"[adcs] analysis skipped: {e}", "warn")
+        _load_log(f"[adcs] analysis skipped: {e}", "warn")
     STATE["analyzer"] = az
     return az
 
 
-def _run_collection(params):
-    STATE["collecting"] = True
-    STATE["logs"] = []
+def _load_run(run_id: str):
+    """Load a loot run by ID into STATE. Returns (ok, error_or_None)."""
+    run_dir = loot.run_dir_for(ROOT, run_id)
+    if not run_dir:
+        return False, "run not found"
     try:
-        client = LdapClient(
-            dc=params["dc"], username=params["username"], password=params.get("password", ""),
-            domain=params.get("domain", ""), nthash=params.get("nthash", ""),
-            use_ldaps=params.get("ldaps", False), use_kerberos=params.get("kerberos", False),
-            aes_key=params.get("aes_key", ""), dc_ip=params.get("dc_ip", ""),
-            log=_emit_log,
-        )
-        if not client.connect():
-            _emit_log("[collect] connection failed — aborting", "error")
-            socketio.emit("done", {"ok": False})
-            return
-
-        do_gpo = params.get("gpo", True)
-        host_mode = params.get("host_mode", "none")   # "none" | "all" | "list"
-        hosts_spec = params.get("hosts", "")
-        session_mode = params.get("session_mode", "none")   # "none" | "all" | "list"
-        smb_creds = None
-        if do_gpo or host_mode != "none" or session_mode != "none":
-            smb_creds = SmbCreds(
-                username=params["username"], password=params.get("password", ""),
-                domain=client.domain, nthash=params.get("nthash", ""),
-                use_kerberos=params.get("kerberos", False), aes_key=params.get("aes_key", ""),
-                dc_ip=params.get("dc_ip", "") or client.dc_ip or "", log=_emit_log)
-
-        store = collector_mod.collect(
-            client, log=_emit_log, smb_creds=smb_creds, dc_host=params["dc"],
-            dc_ip=params.get("dc_ip", "") or client.dc_ip or "",
-            do_gpo=do_gpo, host_targets=None)
-        client.close()
-
-        # Tier 3 host plane, resolved after LDAP.
-        if smb_creds and host_mode == "list" and hosts_spec:
-            targets = hr_mod.hosts_from_spec(hosts_spec)
-            hr_mod.collect_host_rights(store, smb_creds, targets, log=_emit_log)
-        elif smb_creds and host_mode == "all":
-            targets = hr_mod.hosts_from_store(store)
-            hr_mod.collect_host_rights(store, smb_creds, targets, log=_emit_log)
-        # Tier 3 live session plane, resolved after LDAP.
-        if smb_creds and session_mode != "none":
-            from adcontrol import sessions as sess_mod
-            stargets = (hr_mod.hosts_from_spec(hosts_spec)
-                        if session_mode == "list" and hosts_spec
-                        else hr_mod.hosts_from_store(store))
-            sess_mod.collect_sessions(store, smb_creds, stargets, log=_emit_log)
-        STATE["store"] = store
-        _set_analyzer(store)
-        # Persist.
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(SESS_DIR, f"{store.domain or 'domain'}_{ts}.pkl")
-        try:
-            with open(path, "wb") as fh:
-                pickle.dump(store, fh)
-            _emit_log(f"[collect] session saved: {os.path.basename(path)}", "info")
-        except Exception as e:
-            _emit_log(f"[collect] session save failed: {e}", "warn")
-        socketio.emit("done", {"ok": True, "count": len(store),
-                               "principals": len(store.principals())})
+        store = loot.load_store(run_dir)
     except Exception as e:
-        _emit_log(f"[collect] error: {e}", "error")
-        socketio.emit("done", {"ok": False})
-    finally:
-        STATE["collecting"] = False
+        return False, str(e)
+    STATE["load_log"] = []
+    STATE["store"] = store
+    STATE["run_id"] = run_id
+    _set_analyzer(store)
+    return True, None
+
+
+def load_run_for_cli(run_id: str):
+    """Load a loot run and return (store, analyzer) for no-GUI report generation
+    (see adcontrol_web.py --subject / --offline-report). Raises ValueError on
+    failure; does not touch the web server's STATE."""
+    run_dir = loot.run_dir_for(ROOT, run_id)
+    if not run_dir:
+        raise ValueError(f"run not found: {run_id}")
+    store = loot.load_store(run_dir)
+    az = _set_analyzer(store)
+    return store, az
 
 
 @app.route("/")
@@ -154,121 +97,31 @@ def index():
 def status():
     store = STATE["store"]
     return jsonify({
-        "collecting": STATE["collecting"],
         "collected": store is not None,
+        "run_id": STATE["run_id"],
         "count": len(store) if store else 0,
         "principals": len(store.principals()) if store else 0,
         "domain": store.domain if store else "",
     })
 
 
-@app.route("/api/prefill")
-def prefill():
-    """Values the GUI uses to pre-populate the collect form (and auto-start when
-    CLI creds were supplied). Password is never included — the form uses the
-    sentinel, which /api/collect swaps for the real value server-side."""
-    if not PREFILL:
-        return jsonify({"has_creds": False})
-    return jsonify({
-        "has_creds": True,
-        "autostart": PREFILL.get("autostart", False),
-        "dc": PREFILL.get("dc", ""),
-        "username": PREFILL.get("username", ""),
-        "domain": PREFILL.get("domain", ""),
-        # sentinel stands in for a supplied password so the browser never sees it
-        "password": _PW_SENTINEL if PREFILL.get("password") else "",
-        "nthash": PREFILL.get("nthash", ""),
-        "kerberos": PREFILL.get("kerberos", False),
-        "ldaps": PREFILL.get("ldaps", False),
-        "aes_key": PREFILL.get("aes_key", ""),
-        "dc_ip": PREFILL.get("dc_ip", ""),
-        "gpo": PREFILL.get("gpo", True),
-        "host_mode": PREFILL.get("host_mode", "none"),
-        "hosts": PREFILL.get("hosts", ""),
-    })
+@app.route("/api/runs")
+def runs():
+    """Loot runs available to load, newest first."""
+    return jsonify({"runs": loot.list_runs(ROOT)})
 
 
-@app.route("/api/collect", methods=["POST"])
-def collect():
-    if STATE["collecting"]:
-        return jsonify({"error": "collection already running"}), 409
-    params = request.get_json(force=True) or {}
-    # Swap the password sentinel back to the real CLI-supplied secret.
-    if params.get("password") == _PW_SENTINEL:
-        params["password"] = PREFILL.get("password", "")
-    if params.get("nthash") == _PW_SENTINEL:
-        params["nthash"] = PREFILL.get("nthash", "")
-    if not params.get("dc") or not params.get("username"):
-        return jsonify({"error": "dc and username required"}), 400
-    threading.Thread(target=_run_collection, args=(params,), daemon=True).start()
-    return jsonify({"ok": True})
-
-
-@app.route("/api/import-bloodhound", methods=["POST"])
-def import_bloodhound():
-    """Import a BloodHound zip. Accepts either an uploaded file (multipart 'file')
-    or a server-side path in JSON {'path': ...}. Loads the store in-process."""
-    from adcontrol import bloodhound as bh_mod
-    src = None
-    tmp = None
-    try:
-        if request.files.get("file"):
-            up = request.files["file"]
-            tmp = os.path.join(SESS_DIR, "_bh_upload.zip")
-            up.save(tmp)
-            src = tmp
-        else:
-            body = request.get_json(silent=True) or {}
-            src = body.get("path", "")
-        if not src or (tmp is None and not os.path.exists(src)):
-            return jsonify({"error": "provide an uploaded file or a valid server path"}), 400
-        STATE["logs"] = []
-        store = bh_mod.import_zip(src, log=_emit_log)
-        STATE["store"] = store
-        _set_analyzer(store)
-        # Persist as a session so it can be reloaded.
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        try:
-            with open(os.path.join(SESS_DIR, f"bloodhound_{store.domain or 'import'}_{ts}.pkl"), "wb") as fh:
-                pickle.dump(store, fh)
-        except Exception:
-            pass
-        return jsonify({"ok": True, "count": len(store), "principals": len(store.principals()),
-                        "domain": store.domain})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    finally:
-        if tmp and os.path.exists(tmp):
-            try:
-                os.remove(tmp)
-            except Exception:
-                pass
-
-
-@app.route("/api/sessions")
-def sessions():
-    out = []
-    for f in sorted(os.listdir(SESS_DIR), reverse=True):
-        if f.endswith(".pkl"):
-            out.append(f)
-    return jsonify({"sessions": out})
-
-
-@app.route("/api/load-session", methods=["POST"])
-def load_session():
-    name = (request.get_json(force=True) or {}).get("name", "")
-    path = os.path.join(SESS_DIR, os.path.basename(name))
-    if not os.path.isfile(path):
-        return jsonify({"error": "not found"}), 404
-    try:
-        with open(path, "rb") as fh:
-            store = pickle.load(fh)
-        STATE["store"] = store
-        _set_analyzer(store)
-        return jsonify({"ok": True, "count": len(store), "principals": len(store.principals()),
-                        "domain": store.domain})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+@app.route("/api/load-run", methods=["POST"])
+def load_run():
+    run_id = (request.get_json(force=True) or {}).get("run_id", "")
+    if not run_id:
+        return jsonify({"error": "run_id required"}), 400
+    ok, err = _load_run(run_id)
+    if not ok:
+        return jsonify({"error": err}), 404
+    store = STATE["store"]
+    return jsonify({"ok": True, "count": len(store), "principals": len(store.principals()),
+                    "domain": store.domain, "run_id": run_id, "log": STATE["load_log"]})
 
 
 # Map AD object_class values → the friendly filter/badge types the GUI uses.
@@ -280,12 +133,14 @@ _TYPE_MAP = {
     "organizationalUnit": "ou",
     "domain": "domain",
     "container": "container",
+    "pKICertificateTemplate": "template",
+    "pKIEnrollmentService": "ca",
 }
 # Default set when no ?types= is given — preserves the original behaviour of
 # only listing selectable principals (user/group/computer).
 _DEFAULT_TYPES = ("user", "group", "computer")
 # Every type the filter UI can request.
-_ALL_TYPES = ("user", "group", "computer", "gpo", "ou", "domain", "container")
+_ALL_TYPES = ("user", "group", "computer", "gpo", "ou", "domain", "container", "template", "ca")
 
 
 def _friendly_type(object_class: str) -> str:
@@ -357,12 +212,13 @@ def _resolve(store, key):
     return store.by_sid(key) or store.by_dn(key)
 
 
-def _edge_json(e):
+def _edge_json(e, tier0_map=None):
     return {"source_sid": e.source_sid, "source_label": e.source_label,
             "target_dn": e.target_dn, "target_label": e.target_label,
             "target_class": e.target_class, "right": e.right, "severity": e.severity,
             "applies_to": e.applies_to, "via": e.via, "inherited": e.inherited,
-            "broad": e.broad, "builtin_noise": e.builtin_noise}
+            "broad": e.broad, "builtin_noise": e.builtin_noise,
+            "target_tier0": (tier0_map or {}).get(e.target_dn)}
 
 
 @app.route("/api/analyze/<path:key>")
@@ -374,21 +230,25 @@ def analyze(key):
     if not subj:
         return jsonify({"error": "principal not found"}), 404
     s = az.summarize(subj)
+    tier0_map = az.tier0_targets()
     # Add the friendly type so the detail header badge matches the list badges.
     subject = dict(s["subject"])
     subject["object_class"] = subject.get("class", "")
     subject["class"] = _friendly_type(subject.get("class", ""))
     return jsonify({
         "subject": subject,
-        "outbound": [_edge_json(e) for e in s["outbound"]],
-        "inbound": [_edge_json(e) for e in s["inbound"]],
+        "outbound": [_edge_json(e, tier0_map) for e in s["outbound"]],
+        "inbound": [_edge_json(e, tier0_map) for e in s["inbound"]],
         "policy_rights": [{
             "plane": pr.plane, "right": pr.right, "trustees": pr.trustees,
             "applies_to": pr.applies_to, "source": pr.source, "severity": pr.severity,
         } for pr in s["policy_rights"]],
         "sessions": _sessions_json(store, subj),
         "local_admin_rdp": s["local_admin_rdp"],
+        "gpo_scope": s["gpo_scope"],
         "adcs": s["adcs"],
+        "template_detail": s["template_detail"],
+        "ca_detail": s["ca_detail"],
         "outbound_high": s["outbound_high"], "inbound_high": s["inbound_high"],
         "effective_group_count": s["effective_group_count"],
     })
@@ -560,6 +420,12 @@ def edge_detail():
                       "role": "holder", "note": "holds the right"})
         chain.append(node(subj, "target", "this object"))
 
+    tier0_map = az.tier0_targets()
+    target_tier0 = tier0_map.get(target_dn)
+    for n in chain:
+        if n.get("role") == "target" and target_tier0:
+            n["tier0"] = target_tier0
+
     adv = advice_mod.advise(right)
     return jsonify({
         "right": right, "advice": adv,
@@ -568,6 +434,7 @@ def edge_detail():
         "trustee_sid": trustee_sid,
         "target_dn": target_dn,
         "target_label": target.label if target else target_dn,
+        "target_tier0": target_tier0,
     })
 
 
@@ -590,11 +457,12 @@ def report(key):
         "Content-Disposition": f'attachment; filename="adcontrol_{safe}.html"'})
 
 
-def run(host="127.0.0.1", port=5006, prefill=None, preloaded_store=None):
-    if prefill:
-        PREFILL.clear()
-        PREFILL.update(prefill)
-    if preloaded_store is not None:
-        STATE["store"] = preloaded_store
-        _set_analyzer(preloaded_store)
-    socketio.run(app, host=host, port=port, allow_unsafe_werkzeug=True)
+def run(host="127.0.0.1", port=5006, initial_run=None):
+    """Start the read-only viewer. *initial_run* (a run_id) is loaded once at
+    startup only — a scan started after the server is already running won't
+    appear until it's picked from the run dropdown or the server is restarted."""
+    if initial_run:
+        ok, err = _load_run(initial_run)
+        if not ok:
+            print(f"[!] could not load run {initial_run}: {err}")
+    app.run(host=host, port=port)

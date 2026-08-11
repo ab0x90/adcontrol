@@ -62,6 +62,7 @@ class LdapClient:
         self._impacket_conn = None
         self._ldap3_conn = None
         self._ldap3_server = None
+        self._config_nc = ""
 
     def log(self, msg, level="info"):
         self._log(msg, level)
@@ -166,6 +167,58 @@ class LdapClient:
                 self.log(f"[LDAP] {label} failed: {e}", "info")
         self.log(f"[LDAP] All NTLM attempts failed. Last: {last}", "error")
         return False
+
+    # -- Configuration NC -------------------------------------------------------
+    def config_naming_context(self) -> str:
+        """The forest's Configuration NC DN, read from the RootDSE.
+
+        There is exactly ONE Configuration NC per forest, always rooted at the
+        FOREST ROOT domain — never guessable from ``base_dn`` when the target is
+        a child domain (e.g. binding to a DC of ``child.corp.local``, base_dn
+        ``DC=child,DC=corp,DC=local``, the real Configuration NC is
+        ``CN=Configuration,DC=corp,DC=local``, one level up — NOT
+        ``CN=Configuration,DC=child,DC=corp,DC=local``, which doesn't exist and
+        makes every Config-NC search — schema GUIDs, extended rights, and ADCS
+        objects — silently return zero results). Cached after first
+        successful fetch; falls back to the (possibly wrong) same-domain guess
+        only if the RootDSE lookup itself fails, so collection still proceeds
+        rather than hard-erroring."""
+        if self._config_nc:
+            return self._config_nc
+        try:
+            if self._impacket_conn is not None:
+                self._config_nc = self._config_nc_impacket()
+            else:
+                self._config_nc = self._config_nc_ldap3()
+        except Exception as e:
+            self.log(f"[LDAP] RootDSE configurationNamingContext lookup failed: {e}", "info")
+        if not self._config_nc:
+            self._config_nc = f"CN=Configuration,{','.join(p for p in self.base_dn.split(',') if p.strip().upper().startswith('DC='))}"
+            self.log("[LDAP] Could not read Configuration NC from RootDSE — falling back to a "
+                     "same-domain guess (wrong if the target is a child domain in a multi-domain forest)", "warn")
+        return self._config_nc
+
+    def _config_nc_ldap3(self) -> str:
+        try:
+            vals = self._ldap3_server.info.other.get("configurationNamingContext")
+            return str(vals[0]) if vals else ""
+        except Exception:
+            return ""
+
+    def _config_nc_impacket(self) -> str:
+        from impacket.ldap import ldapasn1 as la
+        resp = self._impacket_conn.search(searchBase="", scope=0,
+                                          searchFilter="(objectClass=*)",
+                                          attributes=["configurationNamingContext"])
+        for entry in resp or []:
+            if not isinstance(entry, la.SearchResultEntry):
+                continue
+            for attr in entry["attributes"]:
+                if str(attr["type"]) == "configurationNamingContext":
+                    vals = attr["vals"]
+                    if vals:
+                        return str(vals[0])
+        return ""
 
     # -- search ---------------------------------------------------------------
     def search(self, search_filter, attributes, base=None, want_sd=True):

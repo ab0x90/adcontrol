@@ -50,6 +50,11 @@ class Analyzer:
         # Only local-admin is indexed (RDP alone is not a takeover pivot). Used by
         # pathfinding to chain "local admin on H → steal a session on H".
         self._host_admin_index: dict[str, set[str]] | None = None
+        # Lazily-built map of target DN -> win-reason for the Tier-0 goal set
+        # (built-in admin groups, domain head, DCs, Tier-0-linked GPOs). Used to
+        # flag an edge's TARGET as itself a Tier-0 win, independent of whether a
+        # full attack-path search has been run.
+        self._tier0_targets: dict[str, str] | None = None
 
     def _resolve_host_object(self, pr) -> "RawObject | None":
         """The computer object a host-plane PolicyRight applies to, resolved by
@@ -362,6 +367,90 @@ class Analyzer:
 
         return {"local_admin": _dedup_sort(local_admin), "rdp": _dedup_sort(rdp)}
 
+    def tier0_targets(self) -> dict[str, str]:
+        """Map of target DN -> win-reason for the Tier-0 goal set (built-in admin
+        groups, domain head, every DC, every Tier-0-linked GPO). Cached; used to
+        flag when an edge's TARGET is itself a one-hop win — e.g. GenericWrite on
+        a GPO linked to the DCs — without requiring a full path search to notice.
+        Lazy-imports paths.py (which depends on this module) to avoid a circular
+        import at module load time."""
+        if self._tier0_targets is None:
+            from adcontrol.paths import PathFinder
+            self._tier0_targets = PathFinder(self).tier0_targets()
+        return self._tier0_targets
+
+    # -- GPO scope (what a GPO applies to) -------------------------------------
+    def gpo_scope_for(self, subject: RawObject) -> dict:
+        """Where this GPO is linked and what falls under that scope.
+
+        A GPO's blast radius was previously only ever visible indirectly: (1)
+        tier-2 SYSVOL parsing (gpo.py) surfaces a finding only when the GPO
+        pushes a *tracked* security setting (RDP rights, local-admin group
+        membership, …) — a GPO that e.g. only sets a wallpaper produces nothing
+        there, live-only, even if it's linked straight to the DCs; (2)
+        pathfinding's ``_tier0_linked_gpos`` folds a Tier-0-linked GPO into the
+        goal set, but that's only visible if some *other* principal already has
+        a control edge into the GPO — you'd never see it by just selecting the
+        GPO itself. This gives a direct, always-available answer regardless of
+        what the GPO configures or who can edit it.
+
+        Matches ``gplinks`` by DN (live collector's gPLink format) OR by
+        guid/sid (BloodHound import's Links[] format) — the two collectors
+        populate ``gplinks`` differently, so match on whichever the subject GPO
+        has. Returns ``{}`` for non-GPO subjects."""
+        if subject.object_class not in ("groupPolicyContainer", "gpo"):
+            return {}
+
+        keys = {k.lower() for k in (subject.dn, subject.guid, subject.sid) if k}
+
+        linked = []
+        for cont in self.store.objects.values():
+            if cont.object_class not in ("organizationalUnit", "domain"):
+                continue
+            if not any(g.lower() in keys for g in cont.gplinks):
+                continue
+            if cont.object_class == "domain":
+                reach = "the whole domain"
+            elif "domain controllers" in cont.label.lower():
+                reach = "Domain Controllers"
+            else:
+                reach = f"OU {cont.label}"
+            linked.append({"dn": cont.dn, "label": cont.label,
+                            "class": cont.object_class, "reach": reach})
+
+        if not linked:
+            return {"linked": [], "affected_computers": 0, "affected_users": 0,
+                     "affected_tier0": [], "computers": [], "users": []}
+
+        whole_domain = any(l["class"] == "domain" for l in linked)
+        ou_suffixes = [("," + l["dn"]).upper() for l in linked if l["class"] == "organizationalUnit"]
+
+        def _in_scope(dn: str) -> bool:
+            if whole_domain:
+                return True
+            du = dn.upper()
+            return any(du.endswith(sfx) for sfx in ou_suffixes)
+
+        computers, users, tier0_hit = [], [], []
+        for o in self.store.objects.values():
+            if o.object_class not in ("user", "computer") or not _in_scope(o.dn):
+                continue
+            is_tier0 = any(rights.is_builtin_admin_trustee(s)
+                           for s in self.graph.effective_sids(o))
+            row = {"key": o.sid or o.dn, "label": o.label, "tier0": is_tier0}
+            (computers if o.object_class == "computer" else users).append(row)
+            if is_tier0:
+                tier0_hit.append(o.label)
+
+        # Tier-0 members first within each list, then alphabetical — surfaces the
+        # highest-value targets at the top of the "view relationships" table.
+        computers.sort(key=lambda r: (not r["tier0"], r["label"].lower()))
+        users.sort(key=lambda r: (not r["tier0"], r["label"].lower()))
+
+        return {"linked": linked, "affected_computers": len(computers),
+                "affected_users": len(users), "affected_tier0": sorted(set(tier0_hit))[:10],
+                "computers": computers, "users": users}
+
     @staticmethod
     def _account_flags(subject: RawObject) -> list[str]:
         """Short human labels for analysis-relevant account attributes collected
@@ -398,6 +487,25 @@ class Analyzer:
                         "detail": f.detail, "reasons": f.reasons})
         return out
 
+    def template_detail_for(self, subject: RawObject) -> dict:
+        """Full certipy-style template dump when *subject* IS a certificate
+        template (not when it merely enrolls/controls one — that's
+        ``adcs_for``). ``{}`` for any other subject class."""
+        try:
+            from adcontrol import adcs as adcs_mod
+        except Exception:
+            return {}
+        return adcs_mod.template_detail_for(self.store, subject)
+
+    def ca_detail_for(self, subject: RawObject) -> dict:
+        """Registry-derived CA config dump (ESC6/7/8/11/16) when *subject* IS
+        a CA. ``{}`` for any other subject class."""
+        try:
+            from adcontrol import adcs as adcs_mod
+        except Exception:
+            return {}
+        return adcs_mod.ca_detail_for(self.store, subject)
+
     # -- summary --------------------------------------------------------------
     def summarize(self, subject: RawObject) -> dict:
         out = self.outbound(subject)
@@ -416,7 +524,10 @@ class Analyzer:
             "inbound": inb,
             "policy_rights": self.policy_rights_for(subject),
             "local_admin_rdp": self.local_admin_rdp_for(subject),
+            "gpo_scope": self.gpo_scope_for(subject),
             "adcs": self.adcs_for(subject),
+            "template_detail": self.template_detail_for(subject),
+            "ca_detail": self.ca_detail_for(subject),
             "outbound_high": sum(1 for e in out if e.severity == "high"),
             "inbound_high": sum(1 for e in inb if e.severity == "high"),
             "effective_group_count": len(self.graph.group_sids_for(subject)),

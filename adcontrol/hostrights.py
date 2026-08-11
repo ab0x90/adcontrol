@@ -22,6 +22,7 @@ sweep.
 from __future__ import annotations
 
 from adcontrol.model import PolicyRight
+from adcontrol.smbauth import is_access_denied
 
 # Builtin local-alias RIDs.
 _ALIAS_ADMINS = 544
@@ -56,10 +57,18 @@ def _samr_local_members(smb, host, log):
                     sids.append(m["SidPointer"].formatCanonical())
                 out[rid] = sids
             except Exception as e:
-                log(f"[host] {host}: alias {rid} read failed: {e}", "info")
+                if is_access_denied(e):
+                    log(f"[host] {host}: alias {rid} read access denied — scan "
+                        "account is likely not a local admin on this host", "info")
+                else:
+                    log(f"[host] {host}: alias {rid} read failed: {e}", "info")
         dce.disconnect()
     except Exception as e:
-        log(f"[host] {host}: SAMR failed: {e}", "warn")
+        if is_access_denied(e):
+            log(f"[host] {host}: SAMR access denied — scan account is likely "
+                "not a local admin on this host", "warn")
+        else:
+            log(f"[host] {host}: SAMR failed: {e}", "warn")
     return out
 
 
@@ -83,7 +92,11 @@ def _lsa_user_rights(smb, host, log):
                 pass
         dce.disconnect()
     except Exception as e:
-        log(f"[host] {host}: LSA failed: {e}", "warn")
+        if is_access_denied(e):
+            log(f"[host] {host}: LSA access denied — scan account is likely "
+                "not a local admin on this host", "warn")
+        else:
+            log(f"[host] {host}: LSA failed: {e}", "warn")
     return out
 
 
@@ -122,6 +135,7 @@ def collect_host_rights(store, smb_creds, hosts, log=None):
     log(f"[host] querying {len(hosts)} host(s) via SAMR + LSA (opt-in plane)", "info")
     added = 0
     for host, ip in hosts:
+        log(f"[host] -> {host}", "info")
         smb = smb_creds.connect(host, ip)
         if not smb:
             continue
@@ -152,6 +166,7 @@ def collect_host_rights(store, smb_creds, hosts, log=None):
             smb.close()
         except Exception:
             pass
+        log(f"[host] done {host}", "info")
     log(f"[host] collected {added} per-host right finding(s)", "info")
     return added
 

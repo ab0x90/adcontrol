@@ -1,9 +1,11 @@
 # adcontrol runtime dependencies
 # Verified working on Python 3.11–3.13.
 #
-# Only three direct dependencies; the rest are transitive and listed so a fresh
-# install is reproducible. The web GUI uses socketio's "threading" async mode,
-# so eventlet/gevent are deliberately NOT required.
+# adcontrol is split into two independent scripts (see README):
+#   adcontrol_scan.py — gathers, needs impacket/ldap3/rich, no Flask.
+#   adcontrol_web.py  — read-only viewer/reporter, needs Flask, no impacket
+#                       collection paths (still imports adcontrol/ shared
+#                       modules, so impacket/ldap3 stay a blanket dependency).
 
 # --- LDAP + AD security-descriptor parsing --------------------------------
 impacket>=0.12.0          # ldaptypes SD/ACL/ACE parsing, LDAP Kerberos, SAMR, LSA
@@ -13,12 +15,19 @@ ldap3==2.9.1              # NTLM LDAP bind + paged search + SD control
 dnspython>=2.4            # SRV lookup to find a DC from --domain when --dc omitted
                           # (falls back to plain name resolution if absent)
 
-# --- Web GUI ---------------------------------------------------------------
+# --- adcontrol_scan.py terminal dashboard -----------------------------------
+rich>=13.0.0
+
+# --- adcontrol_web.py --------------------------------------------------------
 flask>=3.0
-flask-socketio>=5.3       # pulls python-socketio + python-engineio
+
+# --- ADCS template flag decoding (optional) ---------------------------------
+certipy-ad>=5.0            # reuses certipy's own MS-CRTD flag-bit tables and EKU
+                          # OID name map for the certificate-template detail
+                          # view (adcs.py) — not a hard dependency: ESC detection
+                          # works without it, only the rich "every flag decoded
+                          # by name" display degrades to raw hex if absent
 
 # --- transitive (pinned for reproducibility; safe to remove) ---------------
-python-socketio>=5.11
-python-engineio>=4.9
 pyasn1>=0.6               # impacket ASN.1
 pycryptodomex>=3.20       # impacket crypto
