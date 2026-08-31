@@ -118,35 +118,22 @@ def _is_gmsa(bh, classes) -> bool:
     return str(props.get("samaccounttype") or "") == _SMSA_SAT
 
 
-def _load_json_files(source: str) -> dict[str, list]:
-    """Return {category: [objects]} from a zip path or a directory of json files.
-
-    Category is inferred from meta.type (users/groups/…)."""
-    buckets: dict[str, list] = {}
-
-    def ingest(raw: bytes, name: str):
-        try:
-            doc = json.loads(raw)
-        except Exception:
-            return
-        cat = (doc.get("meta") or {}).get("type") or _cat_from_name(name)
-        buckets.setdefault(cat, []).extend(doc.get("data", []))
-
+def _iter_bh_files(source: str):
+    """Yield (raw_bytes, filename) for each JSON file in source, one at a time."""
     if zipfile.is_zipfile(source):
         with zipfile.ZipFile(source) as z:
             for zi in z.namelist():
                 if zi.lower().endswith(".json"):
-                    ingest(z.read(zi), zi)
+                    yield z.read(zi), zi
     elif os.path.isdir(source):
-        for f in glob.glob(os.path.join(source, "*.json")):
+        for f in sorted(glob.glob(os.path.join(source, "*.json"))):
             with open(f, "rb") as fh:
-                ingest(fh.read(), os.path.basename(f))
+                yield fh.read(), os.path.basename(f)
     elif os.path.isfile(source) and source.lower().endswith(".json"):
         with open(source, "rb") as fh:
-            ingest(fh.read(), os.path.basename(source))
+            yield fh.read(), os.path.basename(source)
     else:
         raise ValueError(f"not a BloodHound zip / json / directory: {source}")
-    return buckets
 
 
 def _cat_from_name(name: str) -> str:
@@ -284,45 +271,68 @@ def _host_rights_from_computer(bh_obj, store, log) -> int:
     return added
 
 
+def _slim_computer(bh: dict) -> dict:
+    """Strip a BloodHound computer dict down to the 5 keys later passes need."""
+    return {
+        "ObjectIdentifier": bh.get("ObjectIdentifier", ""),
+        "LocalGroups":        bh.get("LocalGroups") or [],
+        "UserRights":         bh.get("UserRights") or [],
+        "PrivilegedSessions": bh.get("PrivilegedSessions"),
+        "RegistrySessions":   bh.get("RegistrySessions"),
+        "Sessions":           bh.get("Sessions"),
+    }
+
+
+_CAT_OCLASS = {
+    "users": "user", "groups": "group", "computers": "computer",
+    "domains": "domain", "gpos": "groupPolicyContainer",
+    "ous": "organizationalUnit", "containers": "container",
+}
+
+
 def import_zip(source: str, log=None) -> ObjectStore:
     """Build an ObjectStore from a BloodHound zip / directory / single json.
 
     Mirrors what collector.collect() produces from a live DC.
+    Memory-efficient: streams one JSON file at a time, keeps only minimal
+    inter-pass state (SID strings instead of full BH dicts).
     """
+    import gc
     log = log or (lambda m, l="info": None)
     log(f"[bh] reading {source}", "info")
-    buckets = _load_json_files(source)
-    total = sum(len(v) for v in buckets.values())
-    log(f"[bh] categories: " + ", ".join(f"{k}={len(v)}" for k, v in buckets.items()), "info")
-    if not total:
-        raise ValueError("no objects found in BloodHound data")
 
     store = ObjectStore()
     store.source = f"offline:bloodhound ({os.path.basename(source)})"
     store.collected_at = datetime.datetime.now().isoformat(timespec="seconds")
 
-    # First pass: create every object (so membership inversion can resolve DNs).
-    members_by_group: dict[str, list[str]] = {}   # group DN -> [member DN]
-    computers_raw = []
+    # group DN -> list of raw member ObjectIdentifier strings (not full dicts)
+    members_by_group: dict[str, list[str]] = {}
+    # slimmed computer records — only the keys passes 3 & 4 actually read
+    computers_slim: list[dict] = []
+    total = 0
+    cat_counts: dict[str, int] = {}
 
-    for cat, objs in buckets.items():
+    # First pass: stream one JSON file at a time so raw parsed JSON is freed
+    # as soon as each file is processed — never holding the entire collection.
+    for raw, fname in _iter_bh_files(source):
+        try:
+            doc = json.loads(raw)
+        except Exception:
+            continue
+        finally:
+            del raw  # release compressed/raw bytes immediately
+
+        cat = (doc.get("meta") or {}).get("type") or _cat_from_name(fname)
+        objs = doc.get("data") or []
+        cat_counts[cat] = cat_counts.get(cat, 0) + len(objs)
+        total += len(objs)
+
         for bh in objs:
             oid = bh.get("ObjectIdentifier", "")
             sid = _denamespace_sid(oid)
             dn = _prop(bh, "distinguishedname") or oid
             classes = bh.get("_type") or cat
-            # object_class from meta category (more reliable than per-object type)
-            oclass = {
-                "users": "user", "groups": "group", "computers": "computer",
-                "domains": "domain", "gpos": "groupPolicyContainer",
-                "ous": "organizationalUnit", "containers": "container",
-            }.get(cat) or _ADCS_CAT_CLASS.get(cat, "container")
-            # gMSA / (s)MSA detection — these are principals that can be local
-            # admin, hold SPNs, be granted rights, etc., but BloodHound may deliver
-            # them in a non-users blob (own category, or Base/container-typed),
-            # which would otherwise misclassify them as a container and hide them
-            # from principal-only views. Detect regardless of category and treat
-            # as a user-like principal.
+            oclass = _CAT_OCLASS.get(cat) or _ADCS_CAT_CLASS.get(cat, "container")
             is_gmsa = _is_gmsa(bh, classes)
             if is_gmsa:
                 oclass = "user"
@@ -344,18 +354,13 @@ def import_zip(source: str, log=None) -> ObjectStore:
                 obj.extra["adcs_template"] = adcs_mod.normalize_from_bh(
                     bh.get("Properties") or {})
             obj.enabled = bool(_prop(bh, "enabled", True))
-            # BloodHound exports the AdminSDHolder/protected flag as "admincount"
-            # (older/other collectors may use "adminsdholderprotected"). Accept
-            # either so adminCount-based queries actually have data.
             obj.admin_count = 1 if (_prop(bh, "admincount", False)
                                     or _prop(bh, "adminsdholderprotected", False)) else 0
-            spn = bh.get("SPNTargets") or []
             if _prop(bh, "serviceprincipalnames"):
                 obj.extra["spn"] = _prop(bh, "serviceprincipalnames")
             if bh.get("DomainSID"):
                 store.domain_sid = store.domain_sid or _denamespace_sid(bh["DomainSID"])
 
-            # GPO links on OUs/domain (BloodHound stores under "Links").
             for lk in bh.get("Links") or []:
                 gid = lk.get("GUID") or lk.get("ObjectIdentifier")
                 if gid:
@@ -363,46 +368,56 @@ def import_zip(source: str, log=None) -> ObjectStore:
 
             store.add(obj)
 
-            # Stash raw Members for a second-pass inversion once all objects exist.
             if bh.get("Members"):
-                members_by_group[dn] = bh["Members"]
+                # Store only SID strings — not the full BH member dicts.
+                members_by_group[dn] = [
+                    m.get("ObjectIdentifier", "") for m in bh["Members"]
+                ]
 
             if cat == "computers":
-                computers_raw.append(bh)
+                computers_slim.append(_slim_computer(bh))
 
             if cat == "domains" and not store.domain:
                 store.domain = _prop(bh, "name") or ""
                 store.base_dn = dn
 
-    # Second pass: invert Members -> member_of, resolving member SIDs to DNs.
-    for gdn, members in members_by_group.items():
+        del objs  # let GC reclaim parsed objects for this file before next file
+
+    if not total:
+        raise ValueError("no objects found in BloodHound data")
+    log(f"[bh] categories: " + ", ".join(f"{k}={v}" for k, v in cat_counts.items()), "info")
+    gc.collect()
+
+    # Second pass: invert Members -> member_of.  members_by_group now holds only
+    # SID strings so the overhead is one str per member rather than a full dict.
+    for gdn, member_oids in members_by_group.items():
         group = store.by_dn(gdn)
         if not group:
             continue
-        for m in members:
-            msid = _denamespace_sid(m.get("ObjectIdentifier", ""))
+        for oid in member_oids:
+            msid = _denamespace_sid(oid)
             mobj = store.by_sid(msid)
             if mobj:
                 group.members.append(mobj.dn)
                 mobj.member_of.append(gdn)
 
+    del members_by_group
+    gc.collect()
+
     # Third pass: host-plane findings from computer LocalGroups/UserRights.
     host_added = 0
-    for bh in computers_raw:
+    for bh in computers_slim:
         host_added += _host_rights_from_computer(bh, store, log)
 
-    # Materialize principals that appear ONLY as a host-plane trustee (member of
-    # local Administrators / RDP) but were never collected as their own node —
-    # e.g. a gMSA in a Managed Service Accounts container that wasn't in scope,
-    # or one that classified as a non-principal container. Without this the
-    # finding's trustee is a dead raw SID you cannot select/analyze. We create a
-    # lightweight user-class node so it becomes a first-class, clickable subject.
     materialized = _materialize_orphan_host_trustees(store, log)
     if materialized:
         log(f"[bh] materialized {materialized} orphan host-plane principal(s)", "info")
 
-    # Fourth pass: user↔host logon sessions (BloodHound HasSession).
-    sess_added = _sessions_from_computers(computers_raw, store)
+    # Fourth pass: user↔host logon sessions.
+    sess_added = _sessions_from_computers(computers_slim, store)
+
+    del computers_slim
+    gc.collect()
 
     store.build_session_indexes()
     if not store.domain and store.domain_sid:
