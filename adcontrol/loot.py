@@ -59,7 +59,10 @@ def load_meta(run_dir: str) -> dict:
 
 def save_store(run_dir: str, store):
     path = os.path.join(run_dir, "store.pkl")
-    _atomic_write(path, pickle.dumps(store))
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as fh:
+        pickle.dump(store, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp, path)
 
 
 def load_store(run_dir: str):
