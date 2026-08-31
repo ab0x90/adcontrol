@@ -25,6 +25,11 @@ Usage:
 
   # Offline: import a BloodHound/SharpHound collection instead of scanning live
   python3 adcontrol_scan.py --bloodhound collection.zip
+
+  # Offline report: generate a standalone HTML report from an existing loot run
+  python3 adcontrol_scan.py --offline-report                  # latest run
+  python3 adcontrol_scan.py --offline-report 20260811_143022  # specific run ID
+  python3 adcontrol_scan.py --offline-report loot/20260811_143022/  # explicit path
 """
 
 import argparse
@@ -319,6 +324,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--bloodhound", metavar="PATH",
                     help="Offline: import a BloodHound zip/json/directory instead of "
                          "scanning live. Gathering only — no analysis is run here.")
+    p.add_argument("--offline-report", dest="offline_report", metavar="RUN_ID_OR_PATH",
+                    nargs="?", const="",
+                    help="Generate a standalone HTML report from an existing loot run "
+                         "and exit. No scan or import is performed. Accepts a run ID, "
+                         "a loot directory path, or nothing (uses the most recent run).")
     p.add_argument("--dc", help="Domain controller host/IP")
     p.add_argument("-u", "--username")
     p.add_argument("-p", "--password")
@@ -476,9 +486,47 @@ def _run_bloodhound_import(args, run_id, run_dir):
     return store
 
 
+def _run_offline_report(args):
+    from adcontrol import report_domain as rd_mod
+
+    spec = args.offline_report  # "" = latest; otherwise a run ID or explicit path
+
+    if spec:
+        if os.path.isdir(spec) and os.path.isfile(os.path.join(spec, "store.pkl")):
+            run_dir = spec
+        else:
+            run_dir = loot.run_dir_for(_ROOT, spec)
+            if run_dir is None:
+                console.print(f"[red]No loot run found for '{spec}' — check loot/ for valid run IDs.[/]")
+                sys.exit(1)
+    else:
+        latest = loot.latest_run(_ROOT)
+        if not latest:
+            console.print("[red]No completed runs found in loot/ — run a scan first.[/]")
+            sys.exit(1)
+        run_dir = loot.run_dir_for(_ROOT, latest["run_id"])
+
+    console.print(f"[*] Loading loot from {run_dir} ...")
+    store = loot.load_store(run_dir)
+    console.print(f"[*] Generating offline report ({len(store)} objects, domain {store.domain or '?'}) ...")
+
+    html_content = rd_mod.to_html(store)
+    out_path = os.path.join(run_dir, "report.html")
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write(html_content)
+
+    console.print(f"\n[bold green]Report saved:[/] {out_path}")
+    console.print(f"[dim]Open with: xdg-open \"{out_path}\"[/]")
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
+
+    if args.offline_report is not None:
+        banner()
+        _run_offline_report(args)
+        return
 
     if args.aes_key:
         args.kerberos = True
