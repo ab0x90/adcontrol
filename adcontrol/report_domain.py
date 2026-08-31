@@ -19,8 +19,10 @@ Section 4 is what makes this large; it is what the user explicitly asked for
 from __future__ import annotations
 
 import base64
+import gc
 import gzip
 import html
+import io
 import datetime
 from concurrent.futures import ThreadPoolExecutor
 
@@ -291,7 +293,10 @@ def to_html(store, *, include_principals=True, principal_cap=_PRINCIPAL_CAP) -> 
         def has_edges(o):
             if any(sid in idx for sid in az.graph.effective_sids(o)):
                 return True
-            return any(not a.right.startswith("DENY:") for a in o.aces) or bool(o.owner_sid)
+            # Require high/medium severity so trivial allow-ACEs (SYSTEM,
+            # World-read) on every object don't inflate interesting to the full domain.
+            return any(not a.right.startswith("DENY:") and a.severity in ("high", "medium")
+                       for a in o.aces)
         interesting = sorted((o for o in all_principals if has_edges(o)),
                              key=lambda o: (o.object_class, o.label.lower()))
         if principal_cap is not None and len(interesting) > principal_cap:
@@ -300,23 +305,40 @@ def to_html(store, *, include_principals=True, principal_cap=_PRINCIPAL_CAP) -> 
         # full outbound/inbound tables are built on demand (see report JS) from
         # this JSON blob. This keeps a 10k-object domain instant — the browser is
         # no longer laying out thousands of collapsed tables up front.
-        # _principal_data calls are read-only on store/az — safe to parallelize.
-        pd_workers = min(8, len(interesting) or 1)
-        with ThreadPoolExecutor(max_workers=pd_workers) as ex:
-            data = list(ex.map(lambda o: _principal_data(store, az, o), interesting))
-        has_principals = bool(data)
-        principal_json = _json_blob(data)
-        if len(principal_json) > _COMPRESS_THRESHOLD:
-            _compressed = base64.b64encode(
-                gzip.compress(principal_json.encode("utf-8"), compresslevel=6)
-            ).decode("ascii")
-            _data_tag_extra = ' data-gz="1"'
-            principal_json = _compressed
-        else:
-            _data_tag_extra = ""
+        # Stream JSON one chunk at a time through gzip so we never hold the full
+        # data list AND the full uncompressed JSON string in RAM simultaneously.
+        _CHUNK = 500
+        buf = io.BytesIO()
+        n_principals = 0
+        with gzip.GzipFile(fileobj=buf, mode="wb", compresslevel=6) as gz:
+            gz.write(b"[")
+            first = True
+            for chunk_start in range(0, len(interesting), _CHUNK):
+                chunk_objs = interesting[chunk_start:chunk_start + _CHUNK]
+                workers = min(8, len(chunk_objs))
+                with ThreadPoolExecutor(max_workers=workers) as ex:
+                    chunk_data = list(ex.map(
+                        lambda o: _principal_data(store, az, o), chunk_objs))
+                for d in chunk_data:
+                    if not first:
+                        gz.write(b",")
+                    gz.write(_json_blob(d).encode("utf-8"))
+                    first = False
+                    n_principals += 1
+                del chunk_data
+                gc.collect()
+            gz.write(b"]")
+        compressed_bytes = buf.getvalue()
+        del buf
+        gc.collect()
+        principal_json = base64.b64encode(compressed_bytes).decode("ascii")
+        del compressed_bytes
+        gc.collect()
+        _data_tag_extra = ' data-gz="1"'
+        has_principals = n_principals > 0
         principals_html = (
             '<section id="principals"><h3>Per-principal control '
-            f'<span class="count">{len(data)}</span></h3>'
+            f'<span class="count">{n_principals}</span></h3>'
             '<p class="meta">Each principal\'s outbound (what it controls) and '
             'inbound (who controls it) edges. Detail loads when you open a row. '
             'Use the filter in the sidebar to find a principal.</p>'
