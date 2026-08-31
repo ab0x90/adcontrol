@@ -263,6 +263,10 @@ class PathFinder:
         Controller computer account, and every GPO linked to the DC OU / domain
         root (controlling it pushes code to Tier-0 assets). Once controlled, these
         mean game over."""
+        try:
+            return self._tier0_cache
+        except AttributeError:
+            pass
         targets: dict[str, str] = {}
         for obj in self.store.objects.values():
             if obj.sid and rights.is_builtin_admin_trustee(obj.sid) \
@@ -274,6 +278,7 @@ class PathFinder:
             targets.setdefault(self.az._domain_head.dn,
                                self.az._domain_head.label + " (domain root / DCSync)")
         targets.update(self._tier0_linked_gpos())
+        self._tier0_cache = targets
         return targets
 
     def _becomes_tier0(self, obj: RawObject) -> str:

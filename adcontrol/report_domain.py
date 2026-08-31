@@ -18,13 +18,20 @@ Section 4 is what makes this large; it is what the user explicitly asked for
 
 from __future__ import annotations
 
+import base64
+import gzip
 import html
 import datetime
+from concurrent.futures import ThreadPoolExecutor
 
 from adcontrol.analyze import Analyzer
 from adcontrol.paths import PathFinder
 from adcontrol import queries as q_mod
 from adcontrol import report as report_mod   # reuse per-subject edge/session helpers
+
+# Principal JSON above this size (bytes) is gzip-compressed + base64-encoded
+# inline; the page decompresses it with the native DecompressionStream API.
+_COMPRESS_THRESHOLD = 500_000
 
 _SEV_COLOR = {"high": "#e5484d", "medium": "#e0a800", "low": "#3a9e6a"}
 
@@ -140,10 +147,25 @@ def _paths_section(store, az) -> str:
     pf = PathFinder(az)
     principals = [o for o in store.objects.values()
                   if o.object_class in ("user", "group", "computer")]
+
+    # Pre-compute the SID key sets so we can reject principals with no pivot
+    # edges in O(effective_sids) rather than launching a full BFS. On a domain
+    # with hundreds of thousands of users this eliminates > 99 % of BFS calls.
+    acl_sids = set(az.acl_index.keys())
+    hai_sids  = set(az.host_admin_index.keys())
+
+    def _has_any_pivot(obj):
+        for sid in az.graph.effective_sids(obj):
+            if sid in acl_sids or sid in hai_sids:
+                return True
+        return False
+
     rows = []
     n_reach = 0
     for subj in principals:
         if pf.already_tier0(subj):
+            continue
+        if not _has_any_pivot(subj):
             continue
         paths = pf.find(subj, mode="short")
         if not paths:
@@ -217,7 +239,8 @@ def to_html(store, *, include_principals=True, principal_cap=_PRINCIPAL_CAP) -> 
     included — leaf objects with no inbound/outbound control add size but no
     signal, so they are omitted regardless."""
     az = Analyzer(store)
-    _ = az.acl_index   # warm
+    _ = az.acl_index        # warm before parallel sections
+    _ = az.host_admin_index # warm before parallel sections
     try:
         from adcontrol import adcs as adcs_mod
         adcs_mod.analyze_adcs(store, az)
@@ -225,18 +248,24 @@ def to_html(store, *, include_principals=True, principal_cap=_PRINCIPAL_CAP) -> 
         pass
     now = datetime.datetime.now().isoformat(timespec="seconds")
 
-    # Queries.
-    query_html = []
-    query_nav = []
-    for entry in q_mod.list_queries():
+    # Queries — independent of each other, run in parallel.
+    def _run_query(entry):
         qid, label, desc = entry["id"], entry["label"], entry["description"]
         try:
             hits = q_mod.run_query(qid, store, az)
         except Exception:
             hits = []
+        return qid, label, desc, hits
+
+    query_entries = q_mod.list_queries()
+    workers = min(8, len(query_entries) or 1)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        query_results = list(ex.map(_run_query, query_entries))
+
+    query_html = []
+    query_nav = []
+    for qid, label, desc, hits in query_results:
         query_html.append(_query_section(qid, label, desc, hits))
-        # Nav count matches the section badge: default-visible hits (expected
-        # built-ins are hidden until toggled).
         nav_count = sum(1 for h in hits if not h.get("expected"))
         query_nav.append(f'<a href="#q_{_esc(qid)}">{_esc(label)} '
                          f'<span class="ncount">{nav_count}</span></a>')
@@ -245,6 +274,7 @@ def to_html(store, *, include_principals=True, principal_cap=_PRINCIPAL_CAP) -> 
 
     principals_html = ""
     principal_json = "[]"
+    _data_tag_extra = ""
     has_principals = False
     if include_principals:
         # Users/groups/computers, plus GPOs — a GPO's inbound edges show who can
@@ -270,9 +300,20 @@ def to_html(store, *, include_principals=True, principal_cap=_PRINCIPAL_CAP) -> 
         # full outbound/inbound tables are built on demand (see report JS) from
         # this JSON blob. This keeps a 10k-object domain instant — the browser is
         # no longer laying out thousands of collapsed tables up front.
-        data = [_principal_data(store, az, o) for o in interesting]
+        # _principal_data calls are read-only on store/az — safe to parallelize.
+        pd_workers = min(8, len(interesting) or 1)
+        with ThreadPoolExecutor(max_workers=pd_workers) as ex:
+            data = list(ex.map(lambda o: _principal_data(store, az, o), interesting))
         has_principals = bool(data)
         principal_json = _json_blob(data)
+        if len(principal_json) > _COMPRESS_THRESHOLD:
+            _compressed = base64.b64encode(
+                gzip.compress(principal_json.encode("utf-8"), compresslevel=6)
+            ).decode("ascii")
+            _data_tag_extra = ' data-gz="1"'
+            principal_json = _compressed
+        else:
+            _data_tag_extra = ""
         principals_html = (
             '<section id="principals"><h3>Per-principal control '
             f'<span class="count">{len(data)}</span></h3>'
@@ -408,19 +449,14 @@ details.prin[open]>summary{{border-bottom:1px solid var(--line-soft);margin-bott
 {paths_html}
 {principals_html}
 </main>
-<script type="application/json" id="prindata">{principal_json}</script>
+<script type="application/json" id="prindata"{_data_tag_extra}>{principal_json}</script>
 <script>
-// Per-principal section: LAZY-RENDERED. The DOM starts with only light summary
-// rows (one per principal); each row's outbound/inbound tables are built from the
-// embedded JSON the first time it's opened. This keeps a 10k-object report fast —
-// the browser never lays out thousands of tables up front. The sidebar filter
-// hides non-matching rows. This is the report's only script; still self-contained.
-(function(){{
+// Named init so both the sync (inline JSON) and async (gzip+b64) paths can
+// call it once data is ready. All DOM work lives here; the loader below handles
+// how data arrives.
+function _adcInit(data){{
   var host=document.getElementById('prinlist');
-  var dataEl=document.getElementById('prindata');
-  if(!host||!dataEl) return;
-  var data;
-  try{{ data=JSON.parse(dataEl.textContent); }}catch(e){{ data=[]; }}
+  if(!host) return;
   var empty=document.getElementById('prinempty');
   var counter=document.getElementById('pfiltercount');
   var total=data.length;
@@ -453,7 +489,6 @@ details.prin[open]>summary{{border-bottom:1px solid var(--line-soft);margin-bott
       +'<h4>Inbound — controlled by ('+d['in'].length+')</h4>'+edgeTable(d['in'],'in')
       +sessTable(d.sess);
   }}
-  // Build the light summary rows (no tables) — fast even for thousands.
   var frag=document.createDocumentFragment();
   var rows=[];
   for(var i=0;i<data.length;i++){{ var d=data[i];
@@ -483,15 +518,29 @@ details.prin[open]>summary{{border-bottom:1px solid var(--line-soft);margin-bott
     if(empty) empty.hidden = shown!==0;
     update(shown);
   }};
+}}
+// Load principal data. Small domains inline plain JSON; large ones (> 500 KB)
+// embed gzip+b64 and decompress with the native DecompressionStream API.
+(function(){{
+  var el=document.getElementById('prindata');
+  if(!el) return;
+  if(el.getAttribute('data-gz')){{
+    var b64=el.textContent.trim(), bin=atob(b64);
+    var arr=new Uint8Array(bin.length);
+    for(var i=0;i<bin.length;i++) arr[i]=bin.charCodeAt(i);
+    new Response(new Blob([arr]).stream().pipeThrough(new DecompressionStream('gzip')))
+      .text().then(function(j){{ _adcInit(JSON.parse(j)); }}).catch(function(){{ _adcInit([]); }});
+  }} else {{
+    var d; try{{ d=JSON.parse(el.textContent); }}catch(e){{ d=[]; }}
+    _adcInit(d);
+  }}
 }})();
-// Reveal/hide the "expected" built-in privileged groups in an actor-grouped
-// query section (e.g. takeover_inbound). Off by default; the toggle flips them.
 window.toggleExpected=function(qid, show){{
   var sec=document.getElementById('q_'+qid);
   if(!sec) return;
   sec.querySelectorAll('details.prin.expected').forEach(function(d){{ d.hidden=!show; }});
   var em=sec.querySelector('[data-empty]');
-  if(em) em.hidden = show;   // hide the "only expected" note once revealed
+  if(em) em.hidden = show;
 }};
 </script>
 </body></html>"""
